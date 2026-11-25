@@ -1,0 +1,9 @@
+[submodule "DIDEN_Core"]
+	path = DIDEN_Core
+	url = https://github.com/DIDEN-Robotics/DIDEN_Core
+[submodule "DIDEN_Asset"]
+	path = DIDEN_Asset
+	url = https://github.com/DIDEN-Robotics/DIDEN_Asset
+[submodule "DIDEN_World"]
+	path = DIDEN_World
+	url = https://github.com/DIDEN-Robotics/DIDEN_World

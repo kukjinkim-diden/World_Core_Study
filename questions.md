@@ -1,0 +1,13 @@
+- World에서 policy의 observation space는 어떻게 구성되어 있나? 왜 이렇게 구성했을까?
+- World에서 policy의 action space는 어떻게 구성되어 있나? 왜 이렇게 구성했을까?
+- World에서 reward 함수들은 어떻게 구성되어 있는가? 왜 이 reward를 써야 하는가? 
+- RRT란 무엇인가? Core에서 Spider 로봇의 경로계획을 어떻게 수행하고 있는가?
+- NMPC란 무엇인가? 어떻게 NMPC로 보행하고 있는가? 어떻게 RRT가 만들어준 경로를 NMPC로 보행할 수 있는가?
+- 모터 드라이버, 베이스 보드, 로봇 PC는 어떻게 통신하는가?
+- mujoco simulation에서 scene은 어떻게 구성되는가? 
+- 로봇의 mujoco config 파일은 어떻게 생성하는가?
+- mujoco에서 로봇 동역학 시뮬레이션이 어떻게 동작하는가? 
+- mujoco에서 충돌을 어떻게 시뮬레이션 하는가?
+- 모터는 어떻게 움직이는가?
+- 로봇은 어떻게 실시간으로 상태를 추정하는가?
+- 로봇이 상태 추정하는 정보들에는 무엇이 있는가?
