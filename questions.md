@@ -11,3 +11,8 @@
 - 모터는 어떻게 움직이는가?
 - 로봇은 어떻게 실시간으로 상태를 추정하는가?
 - 로봇이 상태 추정하는 정보들에는 무엇이 있는가?
+- Spider의 자석발은 어떻게 동작하는가? 
+- mujoco-warp는 어떻게 구현되었나? warp 언어는 어떻게 병렬처리에 특화되게 된걸까? 
+- Core에서 policy가 observation을 받고, action을 내뱉으면 로봇으로 어떻게 전달되는가?
+- Core의 FSM은 어떻게 구현되어 있나? -> Booting, Preparing, Ready, Running, E-stop, 
+- 관성모멘트, 관성텐서는 무엇인가?
