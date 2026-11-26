@@ -1,0 +1,38 @@
+#%% md
+## 섹터 1 을 마치며
+
+만든 것을 World 의 파일과 나란히 놓으면 이렇습니다.
+
+| 우리가 만든 것 | 줄 수(대략) | World 의 대응 파일 | 줄 수 |
+|---|---|---|---|
+| `BatchedSim` | 30 | `mjlab.sim.Simulation` + `diden_mjlab/sim/sim.py` | 수백 |
+| `SimAdapter` | 70 | `diden_common/sim_adapter.py` + `sim_adapter_ports.py` + `diden_mjlab/sim_adapter.py` | 2000+ |
+| 매니저 6 개 | 250 | `diden_env/managers/*.py` | 3500 |
+| MDP 함수 15 개 | 80 | `diden_env/mdp/`, `diden_domain/mdp/` | 수천 |
+| `ManagerBasedRlEnv` | 90 | `manager_based_env.py` + `manager_based_rl_env.py` + `mjwarp_env.py` | 1600 |
+| `ActorCritic`, `RolloutStorage`, `PPO`, `OnPolicyRunner` | 250 | `diden_rl/` | 5000+ |
+| `export_policy`, `DeployedController` | 90 | `tools/deploy/`, `diden_env/deploy/`; Core `rl_controller/` | 수천 |
+
+줄 수가 수십 배 차이 나는 이유는 대부분 다음 다섯 가지입니다. 실제 코드를 읽다가 낯선 덩어리를 만나면 이 중 어디에 속하는지부터 가려 봅니다.
+
+1. **로봇이라서**: 관절·PD·접촉·보행 위상·자석. (섹터 2)
+2. **sim-to-real 이라서**: 센서 지연, 액션 지연, 편향, 이력, 추정기, 더 많은 랜덤화.
+3. **엔진이 셋이라서**: 포트로 나눈 `SimAdapter`, 엔진별 구현, 계약 테스트.
+4. **크게 돌려야 해서**: 캐시, CUDA 그래프, 로그 조절, NaN 감시, 원격 학습.
+5. **여러 과제를 한 코드로**: regime, 커리큘럼, 설정 덮어쓰기, 작업 등록.
+
+### 스스로 답해 볼 질문 (`study/QUESTION_TREE.md` 의 Q1 가지)
+
+1. `step()` 안에서 보상 → 리셋 → 관측 순서를 바꾸면 각각 무슨 일이 생기는가?
+2. actor 와 critic 의 관측을 다르게 주는 것이 왜 허용되는가? critic 에만 준 정보가 정책에 "새어 들어갈" 길이 있는가?
+3. 시간 초과와 실패를 구분하지 않으면 가치 함수는 무엇을 배우게 되는가?
+4. 보상을 `(Σ add) × (Π mul)` 로 묶는 설계의 단점은 무엇인가? (힌트: add 가 0 근처일 때 mul 항들의 기울기)
+5. 관측 정규화 통계를 ONNX 안에 넣지 않고 Core 가 따로 갖고 있게 했다면 어떤 사고가 날 수 있는가?
+6. `decimation` 을 바꾸면 다시 맞춰야 하는 값들은 무엇인가? (보상의 `dt`, 에피소드 길이, 이력 간격, 액션 변화율 벌점 …)
+7. 환경 수를 4096 에서 64 로 줄이고 스텝 수를 24 에서 1536 으로 늘리면(표본 수는 같음) 학습이 같을까?
+
+### 다음
+
+- **캡스톤 (선택)**: 이 환경을 **진짜 DIDEN_World 위에** 작업(task)으로 등록해 `dw train` 으로 학습시켜 봅니다. 우리가 만든 것과 이름이 같은 진짜 클래스(`ObsTerm`, `RewTerm`, `EventTerm`, `ManagerBasedRLEnvCfg`)로 설정만 쓰면 되고, 막히는 지점이 곧 섹터 2 에서 배울 내용입니다.
+- **섹터 2 — Spider 보행 MDP**: 관측·액션·보상·이벤트 항을 실제 값 그대로 직접 구현하고 World 의 함수와 출력이 일치하는지 채점합니다.
+- **섹터 4 — Core RL 제어 스택**: Part 17 의 `DeployedController` 를 C++ 로, Core 의 실제 동작 그대로.

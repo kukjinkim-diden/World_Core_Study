@@ -1,0 +1,123 @@
+#%% md
+## Part 7 — site 와 센서: IMU
+
+**site** 는 body 에 붙은 "표시점" 입니다. 질량도 충돌도 없고, 위치와 방향만 있습니다. 센서를 달 자리, 힘을 걸 자리, 발끝처럼 추적하고 싶은 점에 씁니다. Spider 의 `robot.xml` 에는 IMU 자리(`Torso_IMU_site_IAM`), 발끝(`Foot_*_Tip_site`), 자석 힘 작용점(`*_EPMForcePoint_*_site`) 등이 site 로 들어 있습니다.
+
+**sensor** 는 매 스텝 값을 계산해 `d.sensordata` 라는 긴 벡터 하나에 이어 붙여 줍니다. 센서 `i` 의 값은 `d.sensordata[m.sensor_adr[i] : m.sensor_adr[i] + m.sensor_dim[i]]` 에 있습니다.
+
+| MJCF | 값 | 차원 |
+|---|---|---|
+| `<accelerometer site=..>` | site 좌표계에서 본 **비력**(specific force) = 가속도 − 중력 | 3 |
+| `<gyro site=..>` | site 좌표계에서 본 각속도 | 3 |
+| `<framequat objtype="site" objname=..>` | site 의 세계 좌표계 자세 | 4 |
+| `<jointpos joint=..>`, `<jointvel joint=..>` | 관절 각도, 속도 | 1 |
+
+실제 로봇에는 "몸통의 세계 좌표계 자세" 를 직접 알려 주는 센서가 없습니다. 있는 것은 가속도계, 자이로, 관절 엔코더뿐이고, 자세·속도는 **추정** 해야 합니다(Core 의 `engine/estimator`, 섹터 5). 그래서 정책의 관측도 이 센서들로 만들 수 있는 양으로 제한합니다. World 의 actor 관측 첫 두 항이 `imu_ang_vel` 과 `projected_gravity` 인 이유입니다.
+
+### 문제 7-1. IMU 가 달린 상자
+
+`MjSpec` 으로 다음을 만듭니다.
+
+- body `box`: 위치 `(0, 0, 0.5)`, freejoint `box_free`, 상자 geom 하나. 그리고 `gravcomp = 1`.
+- site `imu`: body 원점
+- 센서 3개: `accelerometer`(가속도계), `gyro`(자이로), `orientation`(framequat) — 모두 site `imu` 에
+
+`gravcomp=1` 은 그 body 에 중력과 정확히 반대인 힘을 걸어 줍니다. 누군가 손으로 들고 있는 것과 같아서, 어떤 자세로 돌려 놓아도 그 자리에 가만히 있습니다. (세계에 용접된 body 는 MuJoCo 가 "움직이지 않는 것" 으로 취급해 가속도계가 0 을 읽으므로, 이 실험에는 쓸 수 없습니다.)
+
+<details><summary>힌트</summary>
+
+```python
+box = spec.worldbody.add_body(name="box", pos=[0, 0, 0.5], gravcomp=1)
+spec.add_sensor(name="accelerometer", type=mujoco.mjtSensor.mjSENS_ACCELEROMETER,
+                objtype=mujoco.mjtObj.mjOBJ_SITE, objname="imu")
+```
+자이로는 `mjSENS_GYRO`, 자세는 `mjSENS_FRAMEQUAT` 입니다.
+</details>
+
+#%% ex
+def build_imu_box_spec() -> mujoco.MjSpec:
+    spec = mujoco.MjSpec()
+    #>> body, geom, site, 센서 3개
+    spec.worldbody.add_light(pos=[0, 0, 3])
+    box = spec.worldbody.add_body(name="box", pos=[0, 0, 0.5], gravcomp=1)
+    box.add_freejoint(name="box_free")
+    box.add_geom(name="box_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.2, 0.1, 0.05])
+    box.add_site(name="imu", pos=[0, 0, 0])
+    for name, stype in (("accelerometer", mujoco.mjtSensor.mjSENS_ACCELEROMETER),
+                        ("gyro", mujoco.mjtSensor.mjSENS_GYRO),
+                        ("orientation", mujoco.mjtSensor.mjSENS_FRAMEQUAT)):
+        spec.add_sensor(name=name, type=stype, objtype=mujoco.mjtObj.mjOBJ_SITE, objname="imu")
+    #<<
+    return spec
+
+
+def read_sensor(m, d, name: str) -> np.ndarray:
+    """센서 이름으로 d.sensordata 의 해당 구간을 복사해 돌려준다."""
+    #>> m.sensor(name) 의 adr, dim
+    s = m.sensor(name)
+    adr, dim = int(s.adr[0]), int(s.dim[0])
+    return d.sensordata[adr:adr + dim].copy()
+    #<<
+
+#%% test
+m_imu = build_imu_box_spec().compile()
+d_imu = mujoco.MjData(m_imu)
+mujoco.mj_forward(m_imu, d_imu)
+check("센서 3개, sensordata 길이 3+3+4", m_imu.nsensor == 3 and m_imu.nsensordata == 10)
+check_close("자세: 기울이지 않았으므로 단위 쿼터니언", read_sensor(m_imu, d_imu, "orientation"), [1, 0, 0, 0])
+check_close("자이로: 정지", read_sensor(m_imu, d_imu, "gyro"), [0, 0, 0])
+check_close("가속도계: 위쪽으로 9.81", read_sensor(m_imu, d_imu, "accelerometer"), [0, 0, 9.81], atol=1e-9)
+for _ in range(100):
+    mujoco.mj_step(m_imu, d_imu)
+check_close("gravcomp 덕분에 떨어지지 않음", d_imu.qpos[:3], [0, 0, 0.5], atol=1e-9)
+
+#%% md
+### 먼저 예상해 보기
+
+1. 가만히 들고 있는 상자의 가속도계는 `(0, 0, +9.81)` 을 읽습니다. 왜 **위쪽** 일까요?
+2. 자유낙하 중인 공에 가속도계를 달면 무엇을 읽을까요?
+3. 상자를 x 축으로 30° 기울이면 가속도계 값은 어떻게 변할까요?
+
+### 투영 중력 (projected gravity)
+
+"몸통이 얼마나 기울었는가" 를 정책에 알려 주는 표준 방법이 **몸통 좌표계에서 본 중력 방향** 입니다.
+
+$$g^{B} = R(q)^{\top}\,(0, 0, -1)$$
+
+똑바로 서 있으면 `(0, 0, -1)`, 기울면 x, y 성분이 생깁니다. 쿼터니언 4개를 그대로 넣는 것보다 좋은 이유는 (1) yaw(어느 쪽을 보는가)에 의존하지 않고 (2) 정지 상태의 가속도계로 직접 잴 수 있기 때문입니다.
+
+### 문제 7-2. 투영 중력
+
+Part 2 에서 만든 `quat_rotate_inverse` 를 씁니다.
+
+#%% ex
+def projected_gravity(quat) -> np.ndarray:
+    """세계 좌표계 자세 쿼터니언 (w,x,y,z) → body 좌표계에서 본 단위 중력 방향."""
+    #>> 세계의 (0,0,-1) 을 body 좌표계로
+    return quat_rotate_inverse(quat, np.array([0.0, 0.0, -1.0]))
+    #<<
+
+#%% test
+check_close("똑바로: (0, 0, -1)", projected_gravity([1, 0, 0, 0]), [0, 0, -1])
+_rng = np.random.default_rng(2)
+for _ in range(4):
+    _q = _rng.normal(size=4); _q /= np.linalg.norm(_q)
+    set_free_body(m_imu, d_imu, "box_free", pos=[0, 0, 0.5], quat=_q)      # 상자를 임의 자세로 들고 있는다
+    _acc = read_sensor(m_imu, d_imu, "accelerometer")
+    check_close("정지 상태: 투영 중력 = −가속도계 / |가속도계|", projected_gravity(read_sensor(m_imu, d_imu, "orientation")), -_acc / np.linalg.norm(_acc), atol=1e-9)
+
+# 자유낙하: 가속도계는 0 을 읽는다
+_spec = mujoco.MjSpec.from_string(drop_xml(5.0))
+_spec.body("ball").add_site(name="imu")
+_spec.add_sensor(name="accelerometer", type=mujoco.mjtSensor.mjSENS_ACCELEROMETER, objtype=mujoco.mjtObj.mjOBJ_SITE, objname="imu")
+_m = _spec.compile(); _d = mujoco.MjData(_m)
+for _ in range(50):
+    mujoco.mj_step(_m, _d)
+check_close("자유낙하 중 가속도계 ≈ 0", read_sensor(_m, _d, "accelerometer"), [0, 0, 0], atol=1e-6)
+
+#%% md
+**정리**
+
+- 가속도계는 가속도가 아니라 **비력** 을 잽니다. 정지 상태에서는 바닥이 받쳐 주는 힘 때문에 위쪽 9.81 을 읽고, 자유낙하에서는 0 입니다. 로봇이 걸을 때는 여기에 몸통의 실제 가속도가 섞이므로, 가속도계만으로 기울기를 알 수 없습니다. 자이로 적분과 섞어 쓰는 필터(Core 의 InEKF, complementary)가 필요한 이유입니다.
+- 시뮬레이션에서는 `d.qpos` 의 쿼터니언으로 투영 중력을 "정답" 으로 계산할 수 있습니다. World 는 그렇게 계산한 뒤 **노이즈와 편향을 일부러 섞어** actor 에 줍니다(`projected_gravity`: 기울기 ±0.05 rad, 에피소드 편향 ±0.08 rad). 실제 로봇의 추정 오차를 흉내 내는 것입니다.
+- `robot.xml` 의 IMU site 주석을 읽어 보면 장착 위치를 mm 단위로 재서 넣었고, 축 방향은 아직 확정되지 않았다고 적혀 있습니다. site 하나의 `quat` 이 sim-to-real 을 좌우할 수 있습니다.

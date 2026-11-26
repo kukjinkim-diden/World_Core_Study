@@ -1,0 +1,321 @@
+#%% md
+## Part 17 — ONNX 로 내보내고 "Core 처럼" 실행하기
+
+학습된 정책은 PyTorch 객체입니다. 로봇의 제어 PC 에서 도는 것은 C++ 로 된 DIDEN_Core 이고, 거기에는 PyTorch 가 없습니다. 둘 사이를 잇는 것이 **ONNX 파일 하나** 입니다. World 의 설계 문서는 이 경계를 **SEAM 3** 이라고 부릅니다.
+
+파일에는 두 가지가 들어갑니다.
+
+1. **계산 그래프**: 관측 벡터 → 액션 벡터. 관측 정규화가 그래프 **안에** 들어 있습니다. World 는 추정기까지 합쳐 `actor(normalize(cat(obs, estimator(obs))))` 를 한 그래프로 만듭니다(`tools/deploy/export_merged_onnx.py` 의 `MergedActorEstimator`).
+2. **메타데이터 `policy_config`** (YAML 문자열): 이 그래프를 올바로 쓰는 데 필요한 약속 전부. 관측 항의 이름·순서·차원, 액션 스케일과 기준값, PD 게인, `decimation` 과 `physics_dt` 등. 학습에 쓴 환경에서 **자동으로** 뽑아 씁니다(`diden_env/deploy/serialize.py` 의 `build_policy_config`).
+
+Core 는 정책을 올릴 때 먼저 이 설정을 읽고, 거기 적힌 순서대로 관측을 조립하고, 차원이 그래프 입력과 맞지 않으면 실행을 거부합니다(`rl_controller/policy.cpp`). 관측 순서나 액션 스케일을 사람이 양쪽에 따로 적어 맞추면 생기는 사고를 막기 위한 구조입니다.
+
+**두 레포가 어긋나 보이는 곳 하나.** World 의 `policy_schema.py` 주석은 "Core 가 ONNX 의 `metadata_props` 에서 `policy_config` 를 읽는다" 고 적고 있습니다. 그런데 이 레포의 서브모듈이 가리키는 Core 커밋(`386bae3a8`)의 `policy.h` / `policy.cpp` 는 **ONNX 옆에 놓인 같은 이름의 `.yaml` 파일** 에서만 설정을 읽고, 없으면 로드에 실패합니다. 내용(YAML)은 같고 전달 경로가 다릅니다. 어느 쪽이 최신 약속인지는 코드만으로는 알 수 없으니 팀에 확인할 질문입니다(`QUESTION_TREE.md` Q4). 이 노트북에서는 World 의 방식(메타데이터에 넣기)을 따릅니다.
+
+### 문제 17-1. 정규화를 품은 actor
+
+#%% ex slow
+class MergedActor(nn.Module):
+    """정규화 + actor 를 한 모듈로. 입력: 날것의 관측 (B, obs_dim), 출력: raw 액션의 평균 (B, action_dim)."""
+
+    def __init__(self, actor_critic: ActorCritic):
+        super().__init__()
+        norm = actor_critic.actor_obs_normalizer
+        self.register_buffer("mean", norm.running_mean.clone())
+        self.register_buffer("var", norm.running_var.clone())
+        self.epsilon = norm.epsilon
+        self.actor = copy.deepcopy(actor_critic.actor)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        #>> RunningNormalization.forward 와 같은 식으로 정규화한 뒤 actor
+        return self.actor((obs - self.mean) / torch.sqrt(self.var + self.epsilon))
+        #<<
+
+#%% test slow
+_merged = MergedActor(runner.actor_critic).to(DEVICE).eval()
+_o = torch.randn(64, 9, device=DEVICE) * 3
+runner.actor_critic.eval()
+check_close("MergedActor(obs) == 학습 때의 평균 액션", _merged(_o), runner.actor_critic.act(_o, deterministic=True), atol=1e-5)
+check("탐색 std 는 들어 있지 않음 (배포에서는 평균만 쓴다)", not any("std" in n for n, _ in _merged.named_parameters()))
+
+#%% md
+### 문제 17-2. `policy_config` 만들기
+
+살아 있는 환경 객체에서 다음 사전을 만듭니다. 키 이름은 World 의 스키마(`diden_env/deploy/schema.py`)를 따랐습니다.
+
+```yaml
+rl:
+  observations:            # actor 그룹의 term 을 정의 순서대로
+    - {name: ball_lin_vel, dim: 2}
+    - ...
+  actions:                 # action term 을 정의 순서대로
+    - {name: torque, dim: 2}
+  control:
+    action_scale: 1.0
+    action_clip: 2.0
+  decimation: 4
+  physics_dt: 0.005
+```
+
+값은 전부 `env` 에서 읽습니다: `env.observation_manager.group_term_dims["actor"]`, `env.action_manager._terms`, 각 term 의 `cfg`, `env.cfg.decimation`, `env.physics_dt`.
+
+#%% ex slow
+def build_policy_config(env: ManagerBasedRlEnv) -> dict:
+    #>> 위 구조의 사전. 숫자는 파이썬 기본형(int, float)으로
+    obs_terms = [{"name": n, "dim": int(d)} for n, d in env.observation_manager.group_term_dims["actor"].items()]
+    act_terms = [{"name": n, "dim": int(t.action_dim)} for n, t in env.action_manager._terms.items()]
+    term_cfg = next(iter(env.action_manager._terms.values())).cfg
+    return {"rl": {
+        "observations": obs_terms,
+        "actions": act_terms,
+        "control": {"action_scale": float(term_cfg.scale), "action_clip": None if term_cfg.clip is None else float(term_cfg.clip)},
+        "decimation": int(env.cfg.decimation),
+        "physics_dt": float(env.physics_dt),
+    }}
+    #<<
+
+#%% test slow
+_pc = build_policy_config(env)
+check("관측 항 순서와 차원", _pc["rl"]["observations"] == [{"name": "ball_lin_vel", "dim": 2}, {"name": "ball_ang_vel", "dim": 3},
+                                                      {"name": "goal_rel_pos", "dim": 2}, {"name": "last_action", "dim": 2}])
+check("액션", _pc["rl"]["actions"] == [{"name": "torque", "dim": 2}] and _pc["rl"]["control"] == {"action_scale": 1.0, "action_clip": 2.0})
+check("주기: decimation × physics_dt = 0.02 s", _pc["rl"]["decimation"] == 4 and _pc["rl"]["physics_dt"] == 0.005)
+
+#%% md
+### 문제 17-3. 내보내기
+
+1. `torch.onnx.export(model, dummy, path, **ONNX_EXPORT_CONFIG)` — 설정은 World 의 것(`diden_env/deploy/policy_schema.py`)을 그대로 옮겼습니다. opset 11, 입력 이름 `input`, 출력 이름 `output`, 배치 축 가변.
+2. `onnx.load` 로 다시 열어 `metadata_props` 에 두 항목을 추가한다: `model_kind` 와 `policy_config`(YAML 문자열).
+3. `onnx.save`.
+
+<details><summary>힌트</summary>
+
+```python
+proto = onnx.load(path)
+proto.metadata_props.append(onnx.StringStringEntryProto(key=..., value=...))
+onnx.save(proto, path)
+```
+YAML 문자열은 `yaml.safe_dump(config, sort_keys=False)` 로 만듭니다. `sort_keys=False` 를 빼면 키가 알파벳순으로 정렬됩니다(목록의 순서는 어느 쪽이든 유지됩니다).
+</details>
+
+#%% ex slow
+import warnings
+import onnx
+import onnxruntime as ort
+import yaml
+
+POLICY_CONFIG_METADATA_KEY = "policy_config"
+MODEL_KIND_METADATA_KEY = "model_kind"
+MODEL_KIND = "merged_actor"                       # World: "merged_actor_estimator"
+ONNX_EXPORT_CONFIG = {
+    "export_params": True, "opset_version": 11, "do_constant_folding": True,
+    "input_names": ["input"], "output_names": ["output"],
+    "dynamic_axes": {"input": {0: "batch"}, "output": {0: "batch"}},
+    "dynamo": False,
+}
+
+
+def export_policy(actor_critic: ActorCritic, env: ManagerBasedRlEnv, path: str) -> dict:
+    """ONNX 파일을 쓰고, 넣은 policy_config 사전을 돌려준다."""
+    model = MergedActor(actor_critic).cpu().eval()
+    config = build_policy_config(env)
+    in_dim = sum(t["dim"] for t in config["rl"]["observations"])
+    #>> export → metadata 추가 → save
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.onnx.export(model, torch.zeros(1, in_dim), path, **ONNX_EXPORT_CONFIG)
+    proto = onnx.load(path)
+    proto.metadata_props.append(onnx.StringStringEntryProto(key=MODEL_KIND_METADATA_KEY, value=MODEL_KIND))
+    proto.metadata_props.append(onnx.StringStringEntryProto(key=POLICY_CONFIG_METADATA_KEY, value=yaml.safe_dump(config, sort_keys=False)))
+    onnx.save(proto, path)
+    #<<
+    return config
+
+#%% test slow
+OUT_DIR = Path("_out"); OUT_DIR.mkdir(exist_ok=True)
+ONNX_PATH = str(OUT_DIR / "ball_policy.onnx")
+export_policy(runner.actor_critic, env, ONNX_PATH)
+_sess = ort.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
+_meta = _sess.get_modelmeta().custom_metadata_map
+check("입출력 이름과 모양", _sess.get_inputs()[0].name == "input" and _sess.get_inputs()[0].shape[1] == 9 and _sess.get_outputs()[0].shape[1] == 2)
+check("메타데이터 두 항목", _meta.get("model_kind") == "merged_actor" and "policy_config" in _meta)
+check("policy_config 를 다시 읽으면 원래 사전", yaml.safe_load(_meta["policy_config"]) == build_policy_config(env))
+_x = np.random.default_rng(0).normal(size=(32, 9)).astype(np.float32) * 3
+_y = _sess.run(None, {"input": _x})[0]
+runner.actor_critic.eval()
+check_close("ONNX 출력 == PyTorch 출력 (World 도 내보낼 때 이 검사를 한다)", _y, runner.actor_critic.act(torch.tensor(_x, device=DEVICE), deterministic=True), atol=1e-4)
+print(f"   {ONNX_PATH}: {Path(ONNX_PATH).stat().st_size / 1024:.1f} KB")
+print(_meta["policy_config"])
+
+#%% md
+### "Core 처럼" 실행하기
+
+이제 PyTorch 도, 우리가 만든 환경 클래스도 쓰지 않고 **ONNX 파일 하나와 MuJoCo 만으로** 공을 굴립니다. DIDEN_Core 의 RL 제어기(`applications/controller/runner/rl_controller/`)가 하는 일을 파이썬으로 줄인 것입니다.
+
+| Core 가 하는 일 | 파일 | 여기서 |
+|---|---|---|
+| 정책 설정(YAML)을 읽는다. 관측·액션 차원 합이 그래프와 다르면 거부 | `policy.cpp`, `rl_controller.cpp` | `__init__` |
+| YAML 에 적힌 **순서대로** 관측 항을 계산해 이어 붙인다. 이름 → 함수의 표가 있다 | `observation.cpp` | `OBS_TERMS`, `_build_obs` |
+| 정책 주기 = `decimation × physics_dt`. 러너 스레드는 1 kHz 로 깨어나 시계를 보고, 주기가 찼을 때만 정책을 한 스텝 돌린다 | `runner/thread.cpp` | `tick` 의 카운터 (우리는 시계 대신 tick 수를 센다) |
+| 추론 (ONNX Runtime, CPU) | `engine/inference/inference_engine.cpp` | `self._session.run` |
+| raw 액션 → 물리량 (`action_mean + scale × raw`) → 모터 명령 | `action.cpp` | `_apply` |
+| 관측에 스케일·정규화를 **하지 않는다** (그래프 안에 있으므로) | | 마찬가지 |
+
+관측 함수는 섹터 0 방식(numpy, `MjData` 하나)으로 다시 씁니다. 학습 때의 torch 함수와 **같은 양을 같은 좌표계로** 계산해야 합니다. 이 "같은 계산을 두 언어로 두 번 구현한다" 는 점이 sim-to-real 에서 버그가 가장 자주 나는 곳입니다. World 의 `tests/contract/test_seam3_policy_config.py` 가 World 의 설정과 Core 의 헤더가 어긋나지 않는지 검사하는 이유입니다.
+
+### 문제 17-4. `DeployedController`
+
+- `OBS_TERMS`: 이름 → `fn(m, d, ctrl) -> np.ndarray`. `ctrl` 은 제어기 자신이며 `ctrl.goal_xy`, `ctrl.last_raw_action`, `ctrl.body_id`, `ctrl.qadr`, `ctrl.vadr` 를 쓸 수 있습니다. 네 항을 채웁니다. (각속도는 body → 세계 변환이 필요합니다. 섹터 0 Part 2.)
+- `__init__`: 차원 검사. 맞지 않으면 `ValueError`.
+- `tick(m, d)`: **물리 스텝마다** 불립니다. `decimation` tick 마다 한 번만 관측을 만들고 추론합니다. 토크는 매 tick 써넣습니다.
+
+#%% ex slow
+def _np_quat_rotate(q, v):
+    """(주어진 코드) body → world, numpy. 섹터 0 문제 2-3."""
+    w, u = q[0], q[1:]
+    t = np.cross(u, v)
+    return v + 2.0 * w * t + 2.0 * np.cross(u, t)
+
+
+def _obs_ball_lin_vel(m, d, c) -> np.ndarray:
+    #>> (2,) 세계 좌표계 선속도 xy
+    return d.qvel[c.vadr:c.vadr + 2].copy()
+    #<<
+
+
+def _obs_ball_ang_vel(m, d, c) -> np.ndarray:
+    #>> (3,) 세계 좌표계 각속도 — qvel 의 각속도는 body 좌표계
+    return _np_quat_rotate(d.qpos[c.qadr + 3:c.qadr + 7], d.qvel[c.vadr + 3:c.vadr + 6])
+    #<<
+
+
+def _obs_goal_rel_pos(m, d, c) -> np.ndarray:
+    #>> (2,) 목적지 − 공 위치
+    return c.goal_xy - d.qpos[c.qadr:c.qadr + 2]
+    #<<
+
+
+def _obs_last_action(m, d, c) -> np.ndarray:
+    #>> (2,) 직전 raw 액션
+    return c.last_raw_action.copy()
+    #<<
+
+
+OBS_TERMS = {"ball_lin_vel": _obs_ball_lin_vel, "ball_ang_vel": _obs_ball_ang_vel,
+             "goal_rel_pos": _obs_goal_rel_pos, "last_action": _obs_last_action}
+
+
+class DeployedController:
+    """ONNX 파일 하나로 공을 제어한다. DIDEN_Core 의 RlController 축소판."""
+
+    def __init__(self, onnx_path: str, m: mujoco.MjModel, body_name: str = "ball/sphere"):
+        self._session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        meta = self._session.get_modelmeta().custom_metadata_map
+        if POLICY_CONFIG_METADATA_KEY not in meta:
+            raise ValueError("policy_config 메타데이터가 없는 ONNX 는 실행하지 않는다")
+        self.config = yaml.safe_load(meta[POLICY_CONFIG_METADATA_KEY])["rl"]
+        #>> 차원 검사: 관측 dim 합 == 그래프 입력, 액션 dim 합 == 그래프 출력, 관측 이름이 OBS_TERMS 에 있는가. 아니면 ValueError
+        obs_dim = sum(t["dim"] for t in self.config["observations"])
+        act_dim = sum(t["dim"] for t in self.config["actions"])
+        in_dim, out_dim = self._session.get_inputs()[0].shape[1], self._session.get_outputs()[0].shape[1]
+        if obs_dim != in_dim:
+            raise ValueError(f"관측 차원 불일치: policy_config {obs_dim} vs ONNX 입력 {in_dim}")
+        if act_dim != out_dim:
+            raise ValueError(f"액션 차원 불일치: policy_config {act_dim} vs ONNX 출력 {out_dim}")
+        unknown = [t["name"] for t in self.config["observations"] if t["name"] not in OBS_TERMS]
+        if unknown:
+            raise ValueError(f"모르는 관측 항: {unknown}")
+        #<<
+        if abs(m.opt.timestep - self.config["physics_dt"]) > 1e-9:
+            raise ValueError(f"물리 주기 불일치: 모델 {m.opt.timestep} vs policy_config {self.config['physics_dt']}")
+        self.body_id = m.body(body_name).id
+        joint = m.joint(m.body_jntadr[self.body_id])
+        self.qadr, self.vadr = int(joint.qposadr[0]), int(joint.dofadr[0])
+        self.goal_xy = np.zeros(2)
+        self.last_raw_action = np.zeros(act_dim, dtype=np.float32)
+        self.tick_count = 0
+        self.inference_count = 0
+
+    def _build_obs(self, m, d) -> np.ndarray:
+        #>> policy_config 에 적힌 순서대로 OBS_TERMS 를 불러 이어 붙인 (1, obs_dim) float32
+        parts = [np.asarray(OBS_TERMS[t["name"]](m, d, self), dtype=np.float32) for t in self.config["observations"]]
+        return np.concatenate(parts)[None, :]
+        #<<
+
+    def _apply(self, d) -> None:
+        #>> last_raw_action → clip → scale → 세계 좌표계 토크 (−a_y, a_x, 0) → d.xfrc_applied
+        ctrl = self.config["control"]
+        a = self.last_raw_action
+        if ctrl["action_clip"] is not None:
+            a = np.clip(a, -ctrl["action_clip"], ctrl["action_clip"])
+        a = a * ctrl["action_scale"]
+        d.xfrc_applied[self.body_id, 3:6] = [-a[1], a[0], 0.0]
+        #<<
+
+    def tick(self, m, d) -> None:
+        """물리 스텝마다 mj_step 직전에 부른다."""
+        #>> decimation tick 마다 한 번 추론해 last_raw_action 갱신. 매 tick _apply. tick_count 증가
+        if self.tick_count % self.config["decimation"] == 0:
+            obs = self._build_obs(m, d)
+            self.last_raw_action = self._session.run(None, {"input": obs})[0][0]
+            self.inference_count += 1
+        self._apply(d)
+        self.tick_count += 1
+        #<<
+
+#%% test slow
+def _deploy_run(friction: float, goal_xy, seconds: float = 4.0, record_frames: bool = False):
+    m = build_ball_scene(ball_friction=friction).compile()
+    d = mujoco.MjData(m)
+    ctrl = DeployedController(ONNX_PATH, m)
+    ctrl.goal_xy = np.asarray(goal_xy, dtype=float)
+    d.mocap_pos[0] = [*goal_xy, 0.0]
+    frames = []
+    with mujoco.Renderer(m, 320, 320) as renderer:
+        for i in range(round(seconds / m.opt.timestep)):
+            ctrl.tick(m, d)
+            mujoco.mj_step(m, d)
+            if record_frames and i % 8 == 0:
+                renderer.update_scene(d, camera=make_camera(lookat=(0, 0, 0), distance=8.5, azimuth=90, elevation=-89))
+                frames.append(renderer.render())
+    dist = float(np.linalg.norm(ctrl.goal_xy - d.qpos[:2]))
+    return dist, float(np.linalg.norm(d.qvel[:2])), ctrl, frames
+
+_dist, _speed, _ctrl, _frames = _deploy_run(friction=0.6, goal_xy=(2.0, -1.5), record_frames=True)
+print(f"   4초 뒤: 목적지까지 {_dist:.3f} m, 속력 {_speed:.3f} m/s, 물리 tick {_ctrl.tick_count}, 추론 {_ctrl.inference_count} 회")
+check("추론 횟수 = tick / decimation", _ctrl.tick_count == 800 and _ctrl.inference_count == 200)
+check("ONNX 만으로 목적지에 도착해 멈춤", _dist < 0.25 and _speed < 0.3)
+for _mu in (0.3, 1.0):
+    _dist, _speed, _, _ = _deploy_run(friction=_mu, goal_xy=(-2.5, 2.0))
+    check(f"마찰 {_mu}: 거리 {_dist:.3f} m, 속력 {_speed:.3f} m/s", _dist < 0.25 and _speed < 0.3)
+media.show_video(_frames, fps=25)
+
+# 약속이 어긋난 파일은 거부해야 한다
+_proto = onnx.load(ONNX_PATH)
+_bad = build_policy_config(env)
+_bad["rl"]["observations"].pop(1)                                     # 관측 항 하나를 빼먹은 설정
+for _p in _proto.metadata_props:
+    if _p.key == POLICY_CONFIG_METADATA_KEY:
+        _p.value = yaml.safe_dump(_bad, sort_keys=False)
+onnx.save(_proto, str(OUT_DIR / "bad_policy.onnx"))
+try:
+    DeployedController(str(OUT_DIR / "bad_policy.onnx"), build_ball_scene().compile())
+    _raised = False
+except ValueError as e:
+    _raised = True
+    print("   거부 사유:", e)
+check("관측 차원이 맞지 않는 ONNX 는 거부", _raised)
+
+#%% md
+### 먼저 예상해 보기 → 직접 해 보기
+
+`OBS_TERMS` 를 고쳐서 일부러 약속을 어겨 봅니다. 각각 무슨 일이 생길지 예상한 뒤 `_deploy_run` 으로 확인합니다.
+
+1. `ball_ang_vel` 에서 body → 세계 변환을 빼고 `d.qvel` 의 값을 그대로 쓰면? (차원은 맞으므로 `DeployedController` 는 거부하지 못합니다)
+2. `goal_rel_pos` 의 부호를 반대로(공 − 목적지) 하면?
+3. `policy_config` 의 `decimation` 을 1 로 바꾼 파일을 만들어 돌리면? (정책이 200 Hz 로 돕니다. `physics_dt` 검사는 통과합니다)
+4. `control.action_scale` 을 2.0 으로 바꾸면?
+
+1번과 3번은 "돌아는 가는데 미묘하게 나쁜" 종류입니다. 차원 검사로는 잡히지 않고, 실제 로봇에서는 "sim 에서는 잘 되던 정책이 조금 불안하다" 로 나타납니다. Core 에 정책 입출력을 기록하는 로그(`tools/log_viewer` 의 `rl_io` 뷰어)와, 그 로그를 World 형식으로 되돌려 시뮬레이션과 비교하는 내보내기가 있는 이유입니다.
+
+**실제 코드에서는**: Core 의 관측 항에는 이력(오래된 것부터 / 최신부터 두 가지 순서), EMA·노치 필터, 명령의 데드존과 한계 자르기가 있고, 액션에는 자석 게이트(문턱값, 발별·전체 쿨다운), NaN 일 때 직전 목표 유지, 정책 전환 시 블렌딩이 있습니다. 그리고 우리 `last_action` 은 raw 액션이지만 Core 의 `previous_joint_actions` 는 **직전 관절 목표 각도** 입니다. 같은 이름처럼 보여도 무엇을 담는지는 코드를 열어 봐야 압니다. 이 부분은 **섹터 4** 에서 C++ 퀴즈로 직접 구현합니다(`study/s4_core_rl_quiz/`).

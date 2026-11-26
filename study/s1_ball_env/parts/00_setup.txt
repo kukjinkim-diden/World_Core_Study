@@ -1,0 +1,145 @@
+#%% md
+# 섹터 1 — 공 굴리기 환경: DIDEN_World 를 축소판으로 처음부터
+
+공에 토크를 걸어 **목적지까지 굴려 가서 멈추는** 정책을 학습시킵니다. 과제는 단순하지만, 만드는 구조는 DIDEN_World 가 Spider 를 걷게 할 때 쓰는 구조와 같습니다. 이름도 일부러 같게 짓습니다.
+
+```
+            ┌────────────────────────── ManagerBasedRlEnv.step(action) ──────────────────────────┐
+ action ──▶ │ ActionManager ─▶ [ 물리 × decimation ] ─▶ Termination ─▶ Reward ─▶ (리셋: Event) ─▶ Command ─▶ Observation │ ──▶ obs, reward, terminated, time_outs, extras
+            └───────────────────────────────────────▲─────────────────────────────────────────────┘
+                                                    │ SimAdapter (엔진과 닿는 유일한 창구)
+                                              BatchedSim (mujoco_warp, GPU, 환경 N 개)
+ PPO:  OnPolicyRunner ─ collect(RolloutStorage) ─ compute_returns(GAE) ─ update(ActorCritic)
+```
+
+| Part | 만드는 것 | DIDEN_World 에서 대응하는 파일 |
+|---|---|---|
+| 1 | `BatchedSim` — GPU 병렬 시뮬레이션 | `mjlab.sim.Simulation` (외부 라이브러리), `diden_mjlab/sim/sim.py` |
+| 2 | 쿼터니언 연산 (torch) | `diden_common/math.py` |
+| 3 | `SimAdapter` — 상태 읽기/쓰기 | `diden_common/sim_adapter.py`, `sim_adapter_ports.py`, `diden_mjlab/sim_adapter.py` |
+| 4 | term 설정과 `ManagerBase` | `diden_common/manager_term_cfg.py`, `diden_env/managers/manager_base.py` |
+| 5 | `CommandManager` — 목적지 | `diden_env/managers/command_manager.py`, `diden_env/mdp/commands/` |
+| 6 | `ActionManager` — 토크 | `diden_env/managers/action_manager.py`, `diden_env/mdp/actions/joint_actions.py` |
+| 7 | `ObservationManager` | `diden_env/managers/observation_manager.py` |
+| 8 | `RewardManager` | `diden_env/managers/reward_manager.py` |
+| 9 | `TerminationManager` | `diden_env/managers/termination_manager.py` |
+| 10 | `EventManager` — 리셋과 도메인 랜덤화 | `diden_env/managers/event_manager.py`, `diden_env/mdp/events/` |
+| 11 | `ManagerBasedRlEnv` — 전부 묶기 | `diden_env/env/manager_based_env.py`, `manager_based_rl_env.py`, `diden_mjlab/env/mjwarp_env.py` |
+| 12 | `RunningNormalization`, `ActorCritic` | `diden_rl/modules/utils.py`, `actor_critic.py` |
+| 13 | `RolloutStorage`, GAE | `diden_rl/storage/rollout_storage.py` |
+| 14 | `PPO` | `diden_rl/algorithms/ppo.py` |
+| 15 | `OnPolicyRunner`, 학습 | `diden_rl/runners/on_policy_runner.py`, `tools/engines/mjwarp/train.py` |
+| 16 | 평가와 영상 | `tools/engines/mjwarp/play.py` |
+| 17 | ONNX 내보내기와 "Core 처럼" 실행하기 | `tools/deploy/export_merged_onnx.py`, `diden_env/deploy/`; Core 의 `rl_controller/` |
+
+**실제 코드와 다른 점** 을 미리 적어 둡니다. 이 노트북은 구조를 손에 익히는 것이 목적이라 다음을 뺐습니다. 각 Part 끝에서 "실제로는 여기에 무엇이 더 있는가" 를 다시 짚습니다.
+
+- 로봇이 없습니다. 관절, PD 액추에이터, 접촉 센서, 자석, 보행 위상(gait)은 섹터 2 에서 다룹니다.
+- 상태 추정기 네트워크(`PPOEstimator`), 대칭 증강, 커리큘럼, 관측 이력·지연, 액션 지연이 없습니다.
+- World 는 엔진 세 개(MuJoCo-Warp, IsaacLab, RaiSim)를 `SimAdapter` 뒤에 숨깁니다. 여기서는 MuJoCo-Warp 하나만 붙입니다.
+
+**준비물**: 섹터 0 을 끝냈다고 가정합니다. NVIDIA GPU 가 필요합니다. 첫 실행 때 Warp 가 물리 커널을 컴파일하느라 1~2분 걸리고, 그 뒤로는 캐시를 씁니다.
+
+#%% code
+import os
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+import math
+import time
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+import torch
+import torch.nn as nn
+import mujoco
+import warp as wp
+import mujoco_warp as mjw
+import mediapy as media
+import matplotlib.pyplot as plt
+
+wp.config.quiet = True
+np.set_printoptions(precision=4, suppress=True, linewidth=140)
+torch.set_printoptions(precision=4, sci_mode=False, linewidth=140)
+
+assert torch.cuda.is_available(), "이 노트북은 NVIDIA GPU 가 필요합니다."
+DEVICE = "cuda:0"
+ROOT = next(p for p in [Path.cwd(), *Path.cwd().parents] if (p / "DIDEN_Asset" / "object").is_dir())
+ASSET = ROOT / "DIDEN_Asset"
+print("mujoco", mujoco.__version__, "| torch", torch.__version__, "| warp", wp.__version__, "|", torch.cuda.get_device_name(0))
+
+#%% code
+# 채점·렌더링 도우미 (주어진 코드)
+
+def _np(x):
+    return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+
+
+def check(name, cond):
+    cond = bool(cond)
+    print(("✅ " if cond else "❌ ") + name)
+    assert cond, name
+
+
+def check_close(name, got, want, atol=1e-5, rtol=0.0):
+    got, want = _np(got).astype(float), _np(want).astype(float)
+    ok = got.shape == want.shape and np.allclose(got, want, atol=atol, rtol=rtol)
+    print(("✅ " if ok else "❌ ") + name + ("" if ok else f"\n   got  = {got}\n   want = {want}"))
+    assert ok, name
+
+
+def make_camera(lookat=(0, 0, 0.2), distance=9.0, azimuth=90, elevation=-55):
+    cam = mujoco.MjvCamera()
+    cam.lookat[:] = lookat
+    cam.distance, cam.azimuth, cam.elevation = distance, azimuth, elevation
+    return cam
+
+#%% md
+### 씬 (섹터 0 의 Part 8 에서 직접 만든 것)
+
+섹터 0 에서 만든 `build_ball_scene` 을 그대로 가져옵니다. 달라진 점은 세 가지입니다.
+
+- 바닥에 격자 무늬를 입혔습니다.
+- **바닥 마찰을 낮게(0.05)** 둡니다. 두 geom 의 유효 마찰은 큰 쪽이므로, 이렇게 해 두면 공의 마찰계수가 곧 유효 마찰이 됩니다. Part 10 에서 공의 마찰을 환경마다 다르게 랜덤화합니다.
+- 접촉 풀이 설정을 World 의 Spider 설정에 가깝게 맞췄습니다: 타원 마찰 원뿔(`cone="elliptic"`), 솔버 반복 10회. World 는 선탐색(line search) 반복도 10회로 줄여 쓰는데(`diden_mjlab/sim/sim.py` 의 `get_default_sim_cfg`), 이 씬에서 그렇게 줄이면 "linesearch iterations limit reached" 경고가 나와서 MuJoCo 기본값(50회)을 그대로 둡니다. 반복 횟수는 줄일수록 빠르지만 접촉 풀이가 덜 수렴합니다.
+
+#%% code
+BALL_RADIUS = 0.2
+BALL_MASS = 1.0
+GRAVITY = 9.81
+
+
+def build_ball_scene(ball_mass: float = BALL_MASS, ball_friction: float = 1.0, floor_friction: float = 0.05,
+                     timestep: float = 0.005) -> mujoco.MjSpec:
+    G = mujoco.mjtGeom
+    spec = mujoco.MjSpec()
+    spec.modelname = "ball_scene"
+    spec.option.timestep = timestep
+    spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+    spec.option.iterations = 10
+    wb = spec.worldbody
+    wb.add_light(name="sun", pos=[0, 0, 8], dir=[0, 0, -1], type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL)
+    spec.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D, builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
+                     width=256, height=256, rgb1=[0.22, 0.24, 0.28], rgb2=[0.30, 0.32, 0.37])
+    mat = spec.add_material(name="grid", texrepeat=[1, 1])
+    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
+    wb.add_geom(name="floor", type=G.mjGEOM_PLANE, size=[0, 0, 0.05], friction=[floor_friction, 0.005, 0.0001], material="grid")
+
+    child = mujoco.MjSpec.from_file(str(ASSET / "object" / "sphere.xml"))
+    spec.attach(child, prefix="ball/", frame=wb.add_frame(pos=[0, 0, BALL_RADIUS]))
+    ball = spec.body("ball/sphere")
+    ball.add_freejoint(name="ball/root")
+    for g in ball.geoms:
+        if g.contype:
+            g.density = ball_mass / (4.0 / 3.0 * math.pi * BALL_RADIUS**3)
+            g.friction = [ball_friction, 0.005, 0.0001]
+
+    goal = wb.add_body(name="goal", mocap=True, pos=[1, 0, 0])
+    goal.add_geom(name="goal_marker", type=G.mjGEOM_CYLINDER, size=[0.25, 0.005, 0], rgba=[0.1, 0.9, 0.2, 0.6],
+                  contype=0, conaffinity=0)
+    return spec
+
+
+mjm = build_ball_scene().compile()
+print("nq =", mjm.nq, "nv =", mjm.nv, "| body:", [mjm.body(i).name for i in range(mjm.nbody)], "| 공 질량", mjm.body("ball/sphere").mass[0])

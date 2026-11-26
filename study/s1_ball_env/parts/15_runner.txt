@@ -1,0 +1,151 @@
+#%% md
+## Part 15 — `OnPolicyRunner`: 학습
+
+마지막 조각입니다. 수집 → 반환값 → 갱신을 반복하는 루프이고, World 에서는 `diden_rl/runners/on_policy_runner.py` 의 `learn()` → `_run_training_iteration()` → `_collect_experience()` 입니다. `dw train` 명령이 결국 부르는 것이 이 `learn()` 입니다(`tools/engines/mjwarp/train.py`).
+
+```
+obs = env.reset()
+for it in range(num_iterations):
+    # 1. 수집 (기울기 없이)
+    for _ in range(num_steps_per_env):
+        actions = alg.act(obs)
+        obs, rewards, terminated, time_outs, extras = env.step(actions)
+        alg.process_env_step(rewards, terminated, time_outs, extras)
+    # 2. 반환값
+    alg.compute_returns(obs["critic"])
+    # 3. 갱신
+    info = alg.update()
+```
+
+숫자 감각: 환경 4096 개 × 24 스텝 = 한 iteration 에 98,304 표본, 시뮬레이션 시간으로 환경마다 0.48 초입니다. 300 iteration 이면 약 2900 만 표본, 환경마다 144 초(에피소드 18 개)입니다.
+
+### 문제 15-1. `learn`
+
+기록용 코드(에피소드 보상 합·길이 집계)는 주어져 있습니다. 수집 루프와 갱신을 채웁니다. 수집은 `torch.no_grad()` 안에서 합니다.
+
+#%% ex
+@configclass
+class RunnerCfg:
+    num_steps_per_env: int = 24
+    actor_hidden_dims: tuple = (128, 64)
+    critic_hidden_dims: tuple = (128, 64)
+    init_noise_std: float = 1.0
+    algorithm: PPOCfg = PPOCfg()
+
+
+class OnPolicyRunner:
+    """(World: diden_rl/runners/on_policy_runner.py)"""
+
+    def __init__(self, env: ManagerBasedRlEnv, cfg: RunnerCfg):
+        self.env, self.cfg = env, cfg
+        dims = env.observation_manager.group_obs_dim
+        self.actor_critic = ActorCritic(dims["actor"], dims["critic"], env.num_actions, cfg.actor_hidden_dims,
+                                        cfg.critic_hidden_dims, cfg.init_noise_std).to(env.device)
+        self.alg = PPO(self.actor_critic, cfg.algorithm, env.device)
+        self.alg.init_storage(env.num_envs, cfg.num_steps_per_env, dims["actor"], dims["critic"], env.num_actions)
+        self.history: list[dict] = []
+        self.current_iteration = 0
+        self._obs = None
+
+    def learn(self, num_iterations: int, log_interval: int = 20) -> list[dict]:
+        env, alg = self.env, self.alg
+        if self._obs is None:
+            self._obs, _ = env.reset()
+        obs = self._obs
+        ep_return = torch.zeros(env.num_envs, device=env.device)
+        ep_length = torch.zeros(env.num_envs, device=env.device)
+        for _ in range(num_iterations):
+            t0 = time.time()
+            done_returns, done_lengths, step_rewards, last_log = [], [], [], {}
+            with torch.no_grad():
+                for _ in range(self.cfg.num_steps_per_env):
+                    #>> act → env.step → process_env_step   (결과 변수 이름: obs, rewards, terminated, time_outs, extras)
+                    actions = alg.act(obs)
+                    obs, rewards, terminated, time_outs, extras = env.step(actions)
+                    alg.process_env_step(rewards, terminated, time_outs, extras)
+                    #<<
+                    # ── 기록 (주어진 코드) ──
+                    dones = terminated | time_outs
+                    ep_return += rewards
+                    ep_length += 1
+                    step_rewards.append(rewards.mean().item())
+                    if dones.any():
+                        done_returns.append(ep_return[dones].clone()); done_lengths.append(ep_length[dones].clone())
+                        ep_return[dones] = 0.0; ep_length[dones] = 0.0
+                        last_log = dict(extras.get("log", {}))
+            t_collect = time.time() - t0
+            #>> compute_returns → update   (update 의 반환값을 info 에)
+            alg.compute_returns(obs["critic"])
+            info = alg.update()
+            #<<
+            self.current_iteration += 1
+            rec = {"iteration": self.current_iteration, "mean_step_reward": float(np.mean(step_rewards)),
+                   "mean_episode_return": torch.cat(done_returns).mean().item() if done_returns else float("nan"),
+                   "mean_episode_length": torch.cat(done_lengths).mean().item() if done_lengths else float("nan"),
+                   "action_std": self.actor_critic.std.mean().item(), "collect_s": t_collect, "update_s": time.time() - t0 - t_collect,
+                   **info, **last_log}
+            self.history.append(rec)
+            if self.current_iteration % log_interval == 0 or self.current_iteration == 1:
+                fps = env.num_envs * self.cfg.num_steps_per_env / (time.time() - t0)
+                print(f"it {rec['iteration']:4d} | ep return {rec['mean_episode_return']:6.2f} | ep len {rec['mean_episode_length']:5.0f} | "
+                      f"std {rec['action_std']:.2f} | kl {rec['kl']:.4f} | lr {rec['learning_rate']:.1e} | {fps:,.0f} steps/s")
+        self._obs = obs
+        return self.history
+
+#%% test
+# 짧게 돌려 배선이 맞는지만 확인한다 (환경 512 개, 3 iteration)
+_env = ManagerBasedRlEnv(BallEnvCfg(scene=SceneCfg(num_envs=512)))
+_runner = OnPolicyRunner(_env, RunnerCfg())
+_w0 = _runner.actor_critic.actor[0].weight.clone()
+_hist = _runner.learn(3, log_interval=1)
+check("3 iteration 기록", len(_hist) == 3 and _hist[-1]["iteration"] == 3)
+check("가중치가 갱신됨", not torch.equal(_w0, _runner.actor_critic.actor[0].weight))
+check("저장소가 비워짐", _runner.alg.storage.step == 0)
+check("정규화 통계가 수집 중에 갱신됨 (표본 수 = 512 × 24 × 3 + 1)", abs(_runner.actor_critic.actor_obs_normalizer.count.item() - (512 * 24 * 3 + 1)) < 1)
+check("손실이 유한", all(math.isfinite(_hist[-1][k]) for k in ("surrogate", "value", "entropy", "kl")))
+
+#%% md
+### 학습
+
+환경 4096 개로 300 iteration 을 돌립니다. RTX 5070 기준 2~3 분입니다.
+
+### 먼저 예상해 보기
+
+- 아무것도 배우지 않은 정책(액션 0)의 에피소드 보상 합은 Part 11 에서 본 대로 coarse ≈ 1.9, fine ≈ 0.1, 합쳐서 2 쯤입니다. 완벽한 정책이라면 얼마쯤일까요? (목적지 위에 가만히 있으면 스텝마다 `(1 + 2)·0.02`, 에피소드는 400 스텝)
+- 탐색 표준편차 `std` 는 학습이 진행되면서 어떻게 변할까요?
+
+#%% code slow
+env = ManagerBasedRlEnv(BallEnvCfg())
+runner = OnPolicyRunner(env, RunnerCfg())
+_t0 = time.time()
+history = runner.learn(300)
+print(f"학습 시간 {time.time() - _t0:.0f} 초")
+
+#%% code slow
+fig, axes = plt.subplots(1, 4, figsize=(16, 3.2))
+_it = [h["iteration"] for h in history]
+axes[0].plot(_it, [h["mean_episode_return"] for h in history]); axes[0].set_title("episode return")
+axes[1].plot(_it, [h.get("Episode_Reward/goal_tracking_coarse", np.nan) for h in history], label="coarse")
+axes[1].plot(_it, [h.get("Episode_Reward/goal_tracking_fine", np.nan) for h in history], label="fine"); axes[1].legend(); axes[1].set_title("reward terms (episode sum)")
+axes[2].plot(_it, [h.get("Episode_Termination/out_of_bounds", np.nan) for h in history]); axes[2].set_title("out_of_bounds fraction")
+axes[3].plot(_it, [h["action_std"] for h in history]); axes[3].set_title("action std")
+for ax in axes:
+    ax.set_xlabel("iteration"); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+
+#%% test slow
+_last = history[-20:]
+_ret = float(np.nanmean([h["mean_episode_return"] for h in _last]))
+print(f"   마지막 20 iteration 평균 에피소드 보상 합: {_ret:.2f}  (액션 0 일 때 약 2)")
+check("에피소드 보상 합이 크게 늘었음 (> 10)", _ret > 10.0)
+check("경기장 밖으로 나가는 비율이 줄었음 (< 5 %)", float(np.nanmean([h.get("Episode_Termination/out_of_bounds", np.nan) for h in _last])) < 0.05)
+check("탐색 std 가 줄었음", history[-1]["action_std"] < 0.7)
+
+#%% md
+그래프 읽기:
+
+- **coarse 가 먼저, fine 이 나중에** 오릅니다. 정책은 먼저 "목적지 쪽으로 간다" 를 배우고, 그다음에 "정확히 멈춘다" 를 배웁니다. σ 가 넓은 커널을 같이 둔 이유입니다. fine 만 있으면 목적지에서 1 m 떨어진 곳과 3 m 떨어진 곳의 보상이 둘 다 0 이라 처음에 배울 신호가 없습니다.
+- **out_of_bounds** 는 초반에 잠깐 올랐다가 0 으로 떨어집니다. 토크를 마구 쓰면 밖으로 나간다는 것을 먼저 겪습니다.
+- **std** 는 서서히 줄어듭니다. 엔트로피 보너스가 이것을 늦추고, 이점이 뚜렷해질수록 줄어드는 쪽이 이깁니다.
+
+**실제 코드에서는**: Spider 의 설정은 스텝 32 개, epoch 5, 미니배치 4, 학습률 2.5e-4(적응형, KL 0.01), γ 0.99, λ 0.95 입니다(`diden_rl/configs/`). 커리큘럼이 iteration 10000~15000 구간까지 걸쳐 있을 만큼 오래 돌립니다. 한 iteration 의 표본 수는 4096 × 32 = 131,072 개로 우리와 비슷하지만 iteration 수가 수십 배입니다. 그래서 학습을 원격 GPU 에 뿌리는 `dw fleet`(`tools/`)과 W&B·MLflow 기록(`diden_rl`)이 붙어 있습니다.

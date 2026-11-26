@@ -1,0 +1,184 @@
+#%% md
+## Part 3 — `SimAdapter`: 엔진과 닿는 유일한 창구
+
+관측·보상·리셋 코드가 `sim.qpos[:, 3:7]` 같은 엔진 내부 배열을 직접 만지면, 엔진을 바꿀 때 그 코드를 전부 다시 써야 합니다. World 는 MDP 코드가 엔진에 대해 알아야 하는 것을 `SimAdapter` 한 클래스에 모아 두고(`diden_common/sim_adapter.py`), 엔진마다 구현체를 둡니다(`diden_mjlab/sim_adapter.py` 의 `MujocoWarpSimAdapter`). 설계 문서는 이 경계를 **SEAM 2** 라고 부릅니다. `tests/guards/` 에는 "MDP 코드가 엔진을 직접 import 하지 않는가" 를 검사하는 테스트가 있습니다.
+
+World 의 `SimAdapter` 는 포트 여섯 개(`RootStatePort`, `BodyQueryPort`, `JointControlPort`, `TerrainPort`, `SimWritePort`, `ContactPort`)로 나뉘어 있습니다. 공에는 관절도 지형도 없으므로 여기서는 **root 상태 읽기** 와 **쓰기** 만 만듭니다.
+
+| 우리 메서드 | World 에서 |
+|---|---|
+| `root_pos_w`, `root_quat_w`, `root_lin_vel_w`, `root_ang_vel_w` | `RootStatePort` 의 `base_position`, `base_quat`, `base_lin_vel` … |
+| `write_root_state(env_ids, ...)` | `SimWritePort` 의 root 쓰기 |
+| `set_external_torque_w(torque)` | `SimWritePort.write_external_wrench_to_sim` (자석 힘도 이것으로 건다) |
+| `geom_friction`, `write_geom_friction` | `SimWritePort.write_model_field_indexed` |
+
+### 섹터 0 복습 두 가지
+
+1. freejoint 의 `qvel` 은 앞 3칸(선속도)이 세계 좌표계, 뒤 3칸(각속도)이 **body 좌표계** 입니다.
+2. `xfrc_applied[body] = [힘 3, 토크 3]` 은 세계 좌표계이고, 지울 때까지 유지됩니다.
+
+### 환경마다 다른 모델 값
+
+`put_model` 이 만든 GPU 모델에서 `model.geom_friction` 의 모양은 `(1, ngeom)` 입니다. 맨 앞 1 은 "모든 world 가 같은 값을 쓴다" 는 뜻입니다. 환경마다 마찰을 다르게 주려면 이 배열을 `(N, ngeom)` 로 **늘려서 다시 달아** 줘야 합니다. World 에서는 `MujocoWarpEnv.create_scene` 이 랜덤화할 필드들을 미리 늘려 둡니다(`diden_mjlab/env/mjwarp_env.py`).
+
+```python
+old = sim.model.geom_friction.numpy()                      # (1, ngeom, 3)
+sim.model.geom_friction = wp.array(np.repeat(old, N, axis=0), dtype=wp.vec3, device=...)
+```
+
+### 문제 3-1. `SimAdapter`
+
+#%% ex
+class SimAdapter:
+    """MDP 코드가 시뮬레이터에 대해 아는 전부. 모든 텐서의 첫 축은 환경(world)이다."""
+
+    def __init__(self, sim: BatchedSim, body_name: str = "ball/sphere", geom_name: str = "ball/sphere_collision"):
+        self.sim = sim
+        self.num_envs, self.device = sim.num_envs, sim.device
+        mjm = sim.mjm
+        self.body_id = mjm.body(body_name).id
+        self.geom_id = mjm.geom(geom_name).id
+        joint = mjm.joint(mjm.body_jntadr[self.body_id])           # body 의 첫 관절 = freejoint
+        assert joint.type[0] == mujoco.mjtJoint.mjJNT_FREE
+        self._qadr, self._vadr = int(joint.qposadr[0]), int(joint.dofadr[0])
+        self.radius = float(mjm.geom(geom_name).size[0])
+        self.mass = float(mjm.body(body_name).mass[0])
+        #>> model.geom_friction 을 (N, ngeom) 로 늘려 다시 달고, torch 뷰 self._geom_friction 을 만든다
+        old = sim.model.geom_friction.numpy()
+        expanded = np.repeat(old, self.num_envs, axis=0) if old.shape[0] == 1 else old
+        sim.model.geom_friction = wp.array(expanded, dtype=wp.vec3, device=self.device)
+        self._geom_friction = wp.to_torch(sim.model.geom_friction)   # (N, ngeom, 3)
+        #<<
+
+    # ── 읽기 ───────────────────────────────────────────────
+    @property
+    def root_pos_w(self) -> torch.Tensor:
+        """(N, 3) 세계 좌표계 위치."""
+        #>> qpos 의 freejoint 구간 앞 3칸
+        return self.sim.qpos[:, self._qadr:self._qadr + 3]
+        #<<
+
+    @property
+    def root_quat_w(self) -> torch.Tensor:
+        """(N, 4) 자세 (w,x,y,z)."""
+        #>>
+        return self.sim.qpos[:, self._qadr + 3:self._qadr + 7]
+        #<<
+
+    @property
+    def root_lin_vel_w(self) -> torch.Tensor:
+        """(N, 3) 세계 좌표계 선속도."""
+        #>>
+        return self.sim.qvel[:, self._vadr:self._vadr + 3]
+        #<<
+
+    @property
+    def root_ang_vel_w(self) -> torch.Tensor:
+        """(N, 3) 세계 좌표계 각속도. (qvel 의 각속도는 body 좌표계!)"""
+        #>> quat_apply 로 body → world
+        return quat_apply(self.root_quat_w, self.sim.qvel[:, self._vadr + 3:self._vadr + 6])
+        #<<
+
+    @property
+    def geom_friction(self) -> torch.Tensor:
+        """(N,) 공 collision geom 의 미끄럼 마찰계수."""
+        #>>
+        return self._geom_friction[:, self.geom_id, 0]
+        #<<
+
+    # ── 쓰기 ───────────────────────────────────────────────
+    def write_root_state(self, env_ids: torch.Tensor, pos: torch.Tensor, quat: torch.Tensor,
+                         lin_vel_w: torch.Tensor, ang_vel_w: torch.Tensor) -> None:
+        """env_ids 환경의 공 상태를 덮어쓴다. 속도는 둘 다 세계 좌표계로 받는다."""
+        #>> qpos 7칸, qvel 6칸. 각속도는 world → body 로 바꿔 넣는다
+        self.sim.qpos[env_ids, self._qadr:self._qadr + 3] = pos
+        self.sim.qpos[env_ids, self._qadr + 3:self._qadr + 7] = quat
+        self.sim.qvel[env_ids, self._vadr:self._vadr + 3] = lin_vel_w
+        self.sim.qvel[env_ids, self._vadr + 3:self._vadr + 6] = quat_apply_inverse(quat, ang_vel_w)
+        #<<
+
+    def set_external_torque_w(self, torque_w: torch.Tensor) -> None:
+        """(N, 3) 세계 좌표계 토크를 공에 건다. 다음에 다시 부를 때까지 유지된다."""
+        #>> xfrc_applied 의 토크 칸
+        self.sim.xfrc_applied[:, self.body_id, 3:6] = torque_w
+        #<<
+
+    def write_geom_friction(self, env_ids: torch.Tensor, friction: torch.Tensor) -> None:
+        """env_ids 환경의 공 미끄럼 마찰계수를 바꾼다."""
+        #>>
+        self._geom_friction[env_ids, self.geom_id, 0] = friction
+        #<<
+
+    def set_goal_marker(self, goal_pos_w: torch.Tensor) -> None:
+        """(주어진 코드) 목적지 표시(mocap body)를 옮긴다. 물리에는 영향이 없고 그림에만 쓰인다."""
+        self.sim.mocap_pos[:, 0, :] = goal_pos_w
+
+#%% test
+N = 4096
+sim = BatchedSim(mjm, N)
+adapter = SimAdapter(sim)
+check("읽기 모양", adapter.root_pos_w.shape == (N, 3) and adapter.root_quat_w.shape == (N, 4)
+      and adapter.root_lin_vel_w.shape == (N, 3) and adapter.root_ang_vel_w.shape == (N, 3))
+check("마찰이 환경마다 따로 (N, ngeom, 3)", tuple(sim.model.geom_friction.shape) == (N, mjm.ngeom) and adapter.geom_friction.shape == (N,))
+
+# 쓰기 → 읽기 왕복
+_ids = torch.tensor([0, 7, 4095], device=DEVICE)
+_quat = torch.tensor([[math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4)]], device=DEVICE).expand(3, 4)   # z 축 90°
+_ang_w = torch.tensor([[0.0, 1.0, 0.0]], device=DEVICE).expand(3, 3)
+adapter.write_root_state(_ids, torch.tensor([[1.0, 2.0, 0.2]], device=DEVICE).expand(3, 3), _quat,
+                         torch.tensor([[0.3, 0.0, 0.0]], device=DEVICE).expand(3, 3), _ang_w)
+sim.forward()
+check_close("위치 왕복", adapter.root_pos_w[_ids], [[1.0, 2.0, 0.2]] * 3)
+check_close("세계 각속도 왕복", adapter.root_ang_vel_w[_ids], _ang_w, atol=1e-6)
+check_close("qvel 에는 body 좌표계로 들어감: 공이 z 로 90° 돌아 있으므로 world y = body x", sim.qvel[_ids, 3:6], [[1.0, 0.0, 0.0]] * 3, atol=1e-6)
+check_close("다른 환경은 그대로", adapter.root_pos_w[1], [0.0, 0.0, 0.2], atol=1e-6)
+
+#%% md
+### 4096 개 환경으로 실험 한 번에 하기
+
+섹터 0 문제 4-5 에서 "토크를 키우면 어느 순간 헛돈다" 를 토크 두 개로 확인했습니다. 이제 환경이 4096 개 있으니, **토크를 0 에서 4 N·m 까지 4096 단계로** 나눠 한 번에 돌릴 수 있습니다. 마찰도 절반은 0.3, 절반은 1.0 으로 줍니다.
+
+### 먼저 예상해 보기
+
+가로축 토크, 세로축 1초 뒤 속도(= 평균 가속도) 그래프는 어떤 모양일까요? 마찰이 0.3 인 환경과 1.0 인 환경의 그래프는 어디서 갈라질까요? ($a = \tau / (\tfrac75 m r)$, 헛돌 때 $a \approx \mu g$)
+
+#%% code
+sim = BatchedSim(mjm, N)
+adapter = SimAdapter(sim)
+_all = torch.arange(N, device=DEVICE)
+_mu = torch.where(_all % 2 == 0, 0.3, 1.0)
+adapter.write_geom_friction(_all, _mu)
+_tau = torch.linspace(0.0, 4.0, N, device=DEVICE)
+_torque = torch.zeros(N, 3, device=DEVICE)
+_torque[:, 1] = _tau                                    # 세계 y 축 토크 → +x 로 굴러간다
+adapter.set_external_torque_w(_torque)
+for _ in range(200):                                    # 1초
+    sim.step()
+_accel = adapter.root_lin_vel_w[:, 0] / (200 * sim.dt)
+_slip = adapter.root_lin_vel_w[:, 0] - adapter.root_ang_vel_w[:, 1] * adapter.radius      # 접촉점 미끄럼 속도
+
+plt.figure(figsize=(7, 3.6))
+for _m, _c in ((0.3, "tab:orange"), (1.0, "tab:blue")):
+    _sel = _mu == _m
+    plt.plot(_np(_tau[_sel]), _np(_accel[_sel]), color=_c, label=f"sim, mu = {_m}")
+    plt.axhline(_m * GRAVITY, color=_c, ls=":", lw=1)
+    plt.axvline(1.4 * _m * BALL_MASS * GRAVITY * BALL_RADIUS, color=_c, ls=":", lw=1)
+plt.plot(_np(_tau), _np(_tau) / (1.4 * BALL_MASS * BALL_RADIUS), "k--", lw=1, label="no slip: tau / (7/5 m r)")
+plt.xlabel("torque [N m]"); plt.ylabel("acceleration [m/s^2]"); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout(); plt.show()
+
+#%% test
+_noslip = (_mu == 1.0) & (_tau > 0.2) & (_tau < 0.8 * 1.4 * 1.0 * BALL_MASS * GRAVITY * BALL_RADIUS)
+check_close("미끄러지지 않는 구간: a = τ / (7/5·m·r)", _accel[_noslip], _tau[_noslip] / (1.4 * BALL_MASS * BALL_RADIUS), rtol=0.02)
+check("그 구간에서는 접촉점이 거의 미끄러지지 않음", _slip[_noslip].abs().max() < 0.05)
+_slipping = (_mu == 0.3) & (_tau > 2.0)
+check("μ=0.3, τ>2: 헛돈다 (접촉점 미끄럼 속도 < −1 m/s)", (_slip[_slipping] < -1.0).all())
+check("헛도는 구간: 평균 가속도가 μg 근처 (±20%)", abs(_accel[_slipping].mean().item() / (0.3 * GRAVITY) - 1) < 0.2)
+check("헛도는 구간: 토크를 더 줘도 가속도는 '미끄러지지 않을 때' 값에 한참 못 미침", (_accel[_slipping] < 0.75 * _tau[_slipping] / (1.4 * BALL_MASS * BALL_RADIUS)).all())
+print(f"   μ=0.3 에서 헛돌 때 가속도: {_accel[_slipping].mean():.2f} m/s²  (μg = {0.3 * GRAVITY:.2f})")
+
+#%% md
+헛도는 구간의 그래프는 $\mu g$ 주변에서 들쭉날쭉합니다. 섹터 0 에서 본 "부드러운 접촉" 때문입니다. 미끄러지는 동안의 마찰력은 제약 풀이(여기서는 반복 10회)의 결과라서 쿨롱 마찰 $\mu N$ 과 수십 % 까지 차이가 납니다. 시뮬레이터의 마찰은 "미끄러지지 않는 구간" 에서는 정확하고 "미끄러지는 구간" 에서는 근사라는 점을 기억해 둡니다.
+
+이 그래프가 Part 6 에서 **액션 스케일** 을 정하는 근거입니다. 마찰을 0.3~1.0 으로 랜덤화하면 헛돌지 않는 최대 토크가 환경마다 0.82~2.75 N·m 로 달라집니다. 정책은 마찰을 직접 볼 수 없으므로(actor 관측에 넣지 않습니다), 속도 변화를 보고 스스로 조절하는 법을 배워야 합니다.
+
+**실제 코드에서는**: World 의 `SimAdapter` 는 읽은 값을 스텝마다 **캐시** 합니다(`diden_common/sim_state_cache.py`). 보상 항 30 개가 각자 `base_lin_vel` 을 부르면 body 좌표계 변환을 30 번 하게 되기 때문입니다. 캐시는 물리 서브스텝마다 무효화됩니다(`ManagerBasedRlEnv.on_physics_substep`).

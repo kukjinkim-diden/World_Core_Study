@@ -1,0 +1,108 @@
+#%% md
+## Part 9 — `TerminationManager`: 에피소드는 언제 끝나는가
+
+에피소드가 끝나는 이유는 두 종류이고, **학습에서 다르게 취급합니다.**
+
+| | 뜻 | 예 | 가치 추정에서 |
+|---|---|---|---|
+| **terminated** (종료) | 과제가 실패했다. 이 뒤는 없다. | 로봇이 넘어짐, 공이 경기장 밖으로 나감 | 이후 보상 = 0 |
+| **time_out** (시간 초과, truncated) | 잘하고 있었는데 시간이 다 됐다. | 에피소드 길이 도달 | 계속했다면 받았을 보상을 추정해 더해 준다 (bootstrap) |
+
+둘을 구분하지 않으면 정책은 "8초가 되면 갑자기 보상이 끊긴다" 를 실패와 똑같이 받아들입니다. 그러면 관측에 시간이 없는데도 가치가 시간에 따라 달라져서 가치 함수 학습이 흔들립니다. 이 구분을 실제로 쓰는 곳은 Part 14 의 PPO 입니다.
+
+World 의 구현(`termination_manager.py`)은 항마다 불리언 `(N,)` 을 받아 `time_out=True` 인 항은 truncated 쪽에, 나머지는 terminated 쪽에 OR 로 모읍니다. Spider 의 종료 항은 `time_out`, NaN 발생, 몸통 속도 한계 초과, 금지된 부위의 접촉, 기울기 60° 초과입니다.
+
+우리 종료 항:
+
+- `time_out`: `env.episode_length_buf >= env.max_episode_length`
+- `out_of_bounds`: 공의 |x| 또는 |y| 가 `limit`(5 m)을 넘음
+
+### 문제 9-1
+
+#%% ex
+def time_out(env) -> torch.Tensor:
+    """(N,) bool. 에피소드 길이에 도달했는가."""
+    #>>
+    return env.episode_length_buf >= env.max_episode_length
+    #<<
+
+
+def out_of_bounds(env, limit: float) -> torch.Tensor:
+    """(N,) bool. 공이 한 변 2·limit 인 정사각형 밖으로 나갔는가."""
+    #>>
+    return (env.sim_adapter.root_pos_w[:, :2].abs() > limit).any(dim=-1)
+    #<<
+
+
+@configclass
+class TerminationTermCfg(ManagerTermBaseCfg):
+    time_out: bool = False
+
+
+class TerminationManager:
+    """(World: diden_env/managers/termination_manager.py)"""
+
+    def __init__(self, cfg, env):
+        self._env = env
+        self._terms = [(name, tc, resolve_term_func(tc, env)) for name, tc in iter_terms(cfg)]
+        n, dev = env.num_envs, env.device
+        self._terminated_buf = torch.zeros(n, dtype=torch.bool, device=dev)
+        self._truncated_buf = torch.zeros(n, dtype=torch.bool, device=dev)
+        self._term_dones = {name: torch.zeros(n, dtype=torch.bool, device=dev) for name, _, _ in self._terms}
+
+    @property
+    def terminated(self) -> torch.Tensor:
+        return self._terminated_buf
+
+    @property
+    def time_outs(self) -> torch.Tensor:
+        return self._truncated_buf
+
+    def compute(self) -> torch.Tensor:
+        """(N,) bool: 이번 스텝에 리셋해야 하는 환경."""
+        #>> 두 버퍼를 False 로 지우고, 항마다 time_out 여부에 따라 OR. 항별 결과는 _term_dones 에
+        self._terminated_buf[:] = False
+        self._truncated_buf[:] = False
+        for name, term_cfg, fn in self._terms:
+            value = fn(self._env, **term_cfg.params)
+            if term_cfg.time_out:
+                self._truncated_buf |= value
+            else:
+                self._terminated_buf |= value
+            self._term_dones[name][:] = value
+        return self._terminated_buf | self._truncated_buf
+        #<<
+
+    def reset(self, env_ids: torch.Tensor) -> dict:
+        """리셋되는 환경들이 어떤 이유로 끝났는지의 비율을 기록한다."""
+        log = {}
+        for name, done in self._term_dones.items():
+            log[f"Episode_Termination/{name}"] = done[env_ids].float().mean().item()
+            done[env_ids] = False
+        return log
+
+#%% test
+@configclass
+class TerminationsCfg:
+    time_out = TerminationTermCfg(func=time_out, time_out=True)
+    out_of_bounds = TerminationTermCfg(func=out_of_bounds, params={"limit": 5.0})
+
+fake = _FakeEnv(num_envs=4)
+_all = torch.arange(4, device=DEVICE)
+fake.termination_manager = TerminationManager(TerminationsCfg(), fake)
+_pos = torch.tensor([[0.0, 0.0, 0.2], [5.1, 0.0, 0.2], [0.0, -5.1, 0.2], [5.1, 0.0, 0.2]], device=DEVICE)
+_zero3 = torch.zeros(4, 3, device=DEVICE)
+fake.sim_adapter.write_root_state(_all, _pos, torch.tensor([[1.0, 0, 0, 0]], device=DEVICE).expand(4, 4), _zero3, _zero3)
+fake.episode_length_buf[:] = torch.tensor([399, 10, 10, 400], device=DEVICE)
+_done = fake.termination_manager.compute()
+check("리셋 대상", _done.tolist() == [False, True, True, True])
+check("terminated: 밖으로 나간 환경", fake.termination_manager.terminated.tolist() == [False, True, True, True])
+check("time_outs: 길이에 도달한 환경", fake.termination_manager.time_outs.tolist() == [False, False, False, True])
+fake.episode_length_buf[0] = 400
+fake.termination_manager.compute()
+check("399 → 400 에서 time_out", fake.termination_manager.time_outs.tolist() == [True, False, False, True])
+_log = fake.termination_manager.reset(_all)
+check_close("종료 이유 비율 기록", [_log["Episode_Termination/time_out"], _log["Episode_Termination/out_of_bounds"]], [0.5, 0.75])
+
+#%% md
+환경 3 은 두 조건이 **동시에** 참입니다. 이런 경우 World 는 terminated 를 우선합니다. 시간 초과로 보고 bootstrap 하는 대상은 `time_out & ~terminated` 인 환경뿐입니다(`manager_based_rl_env.py` 의 `timeout_env_ids`). Part 11 에서 같은 식을 씁니다.

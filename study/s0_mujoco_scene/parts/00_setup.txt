@@ -1,0 +1,96 @@
+#%% md
+# 섹터 0 — MuJoCo 로 씬·오브젝트·로봇 구성하기
+
+DIDEN_World 와 DIDEN_Core 는 둘 다 MuJoCo 위에서 돕니다. World 는 MuJoCo 모델을 GPU 로 올려 수천 개 환경을 병렬로 돌리고, Core 는 같은 로봇 모델을 실제 제어기와 묶어 돌립니다. 그래서 두 레포의 어떤 코드를 읽든 맨 밑바닥에는 **MJCF(XML) → `MjModel` → `MjData`** 가 있습니다. 이 섹터는 그 바닥을 직접 만들어 보는 곳입니다.
+
+끝까지 풀면 다음을 손으로 만들 수 있게 됩니다.
+
+| Part | 만드는 것 | 실제 코드에서 대응하는 곳 |
+|---|---|---|
+| 1 | MJCF 로 공 하나 떨어뜨리기, `MjModel` / `MjData` | 모든 것의 출발점 |
+| 2 | 상태 벡터(`qpos`, `qvel`) 읽고 쓰기, 좌표계 | `DIDEN_World/packages/diden-common/src/diden_common/sim_adapter.py`, `math.py` |
+| 3 | geom, 질량·관성, visual/collision, default class, include | `DIDEN_Asset/object/common.xml`, `DIDEN_Asset/robot/common/*.xml` |
+| 4 | 접촉 필터, 마찰, 접촉력, 구르기 | `DIDEN_Asset/robot/diden_spider_v2/robot.xml` 의 `contype` / `conaffinity` / `condim` |
+| 5 | 관절과 기구학 트리, Spider 다리 한 개, 정기구학 | `robot.xml` 의 `Leg_FL_*`, Core 의 기구학 |
+| 6 | 액추에이터와 PD 제어 | `DIDEN_Asset/robot/common/actuator.xml`, `joint.xml`, World 의 `robots/diden_spider/cfg.py` |
+| 7 | site 와 센서(IMU) | `robot.xml` 의 `Torso_IMU_site_IAM`, `accelerometer`, `gyro` |
+| 8 | `MjSpec` 으로 씬 조립 — 섹터 1 에서 쓸 **공 굴리기 씬** | `DIDEN_World/packages/diden-engines/diden-mjlab/src/diden_mjlab/scene/scene.py` |
+| 9 | 진짜 Spider 로봇 불러와 세우기 | `diden_mjlab/robots/diden_spider/spec.py` |
+
+**푸는 방법**
+
+- `# TODO` 가 있는 셀이 문제입니다. `raise NotImplementedError` 를 지우고 본문을 직접 칩니다.
+- 바로 아래 채점 셀을 실행해 ✅ 가 나오면 다음으로 갑니다. ❌ 면 메시지를 읽고 고칩니다.
+- "먼저 예상해 보기" 는 실행 전에 답을 적어 본 다음 실행해서 맞춰 봅니다. 틀린 예상이 가장 많이 남습니다.
+- 30분 넘게 막히면 힌트(`<details>`)를 펴고, 그래도 안 되면 `s0_mujoco_scene_solutions.ipynb` 의 같은 셀을 봅니다.
+- 이 노트북은 CPU 만 씁니다. GPU 병렬 시뮬레이션은 섹터 1 에서 시작합니다.
+
+#%% code
+import os
+os.environ.setdefault("MUJOCO_GL", "egl")      # 창 없이 GPU 로 렌더링
+
+from pathlib import Path
+import numpy as np
+import mujoco
+import mediapy as media
+
+np.set_printoptions(precision=4, suppress=True, linewidth=140)
+
+# 레포 루트(= DIDEN_Asset 서브모듈이 있는 폴더)를 찾는다.
+ROOT = next(p for p in [Path.cwd(), *Path.cwd().parents] if (p / "DIDEN_Asset" / "object").is_dir())
+ASSET = ROOT / "DIDEN_Asset"
+print("mujoco", mujoco.__version__, "| asset:", ASSET)
+
+#%% code
+# 채점·렌더링 도우미 (주어진 코드)
+
+def check(name, cond):
+    """조건이 참이면 ✅, 아니면 ❌ 를 찍고 멈춘다."""
+    print(("✅ " if cond else "❌ ") + name)
+    assert cond, name
+
+
+def check_close(name, got, want, atol=1e-6, rtol=0.0):
+    got, want = np.asarray(got, dtype=float), np.asarray(want, dtype=float)
+    ok = got.shape == want.shape and np.allclose(got, want, atol=atol, rtol=rtol)
+    print(("✅ " if ok else "❌ ") + name + ("" if ok else f"\n   got  = {got}\n   want = {want}"))
+    assert ok, name
+
+
+def make_camera(lookat=(0, 0, 0.2), distance=3.0, azimuth=135, elevation=-25):
+    cam = mujoco.MjvCamera()
+    cam.lookat[:] = lookat
+    cam.distance, cam.azimuth, cam.elevation = distance, azimuth, elevation
+    return cam
+
+
+def render(m, d, camera=None, width=480, height=360, groups=None):
+    """현재 MjData 를 한 장 그린다. groups: 보이게 할 geom group 번호들 (기본은 MuJoCo 기본값 0~2)."""
+    with mujoco.Renderer(m, height, width) as r:
+        opt = mujoco.MjvOption()
+        if groups is not None:
+            opt.geomgroup[:] = 0
+            for g in groups:
+                opt.geomgroup[g] = 1
+        r.update_scene(d, camera=camera if camera is not None else make_camera(), scene_option=opt)
+        return r.render()
+
+
+def record(m, d, seconds, camera=None, fps=30, step_fn=None, width=480, height=360, groups=None):
+    """seconds 동안 시뮬레이션하며 프레임을 모은다. step_fn(m, d) 가 있으면 매 스텝 직전에 부른다."""
+    frames, n_per_frame = [], max(1, round(1.0 / fps / m.opt.timestep))
+    with mujoco.Renderer(m, height, width) as r:
+        opt = mujoco.MjvOption()
+        if groups is not None:
+            opt.geomgroup[:] = 0
+            for g in groups:
+                opt.geomgroup[g] = 1
+        cam = camera if camera is not None else make_camera()
+        for i in range(round(seconds / m.opt.timestep)):
+            if step_fn is not None:
+                step_fn(m, d)
+            mujoco.mj_step(m, d)
+            if i % n_per_frame == 0:
+                r.update_scene(d, camera=cam, scene_option=opt)
+                frames.append(r.render())
+    return frames

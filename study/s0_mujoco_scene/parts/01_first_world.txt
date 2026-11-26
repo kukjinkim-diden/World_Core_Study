@@ -1,0 +1,142 @@
+#%% md
+## Part 1 — 첫 번째 세계: 공 하나 떨어뜨리기
+
+MuJoCo 를 쓰는 흐름은 항상 세 단계입니다.
+
+```
+MJCF (XML 문자열/파일)  ──컴파일──▶  MjModel (변하지 않는 것: 질량, 형상, 관절 구조, 옵션)
+                                        │
+                                        ▼
+                                     MjData  (매 스텝 변하는 것: qpos, qvel, 접촉, 센서값)
+                                        │  mj_step(model, data)
+                                        ▼
+                                     dt 만큼 지난 MjData
+```
+
+MJCF 의 뼈대는 이렇게 생겼습니다.
+
+```xml
+<mujoco model="이름">
+  <option timestep="0.002"/>            <!-- 물리 설정 -->
+  <worldbody>                            <!-- 세계 좌표계. 여기 바로 붙은 geom 은 움직이지 않는다 -->
+    <light pos="0 0 3"/>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="ball" pos="0 0 1">       <!-- body = 강체 하나 -->
+      <freejoint name="ball_free"/>      <!-- 관절이 없으면 부모에 용접된다. freejoint = 6자유도 -->
+      <geom name="ball_geom" type="sphere" size="0.1"/>   <!-- geom = 형상(충돌·질량·그림) -->
+    </body>
+  </worldbody>
+</mujoco>
+```
+
+- **body** 는 좌표계 하나를 가진 강체입니다. 형상은 없습니다.
+- **geom** 은 body 에 붙는 형상입니다. 충돌, 질량(밀도 × 부피), 렌더링이 모두 geom 에서 나옵니다.
+- **joint** 는 body 가 **부모에 대해** 어떻게 움직일 수 있는지를 정합니다. joint 가 하나도 없는 body 는 부모에 고정됩니다.
+
+### 문제 1-1. 낙하 씬 MJCF 쓰기
+
+아래 조건의 MJCF 문자열을 돌려주는 함수를 씁니다.
+
+| 항목 | 값 |
+|---|---|
+| timestep | 0.002 |
+| 바닥 | `floor`, plane, size `5 5 0.1` |
+| body | `ball`, 위치 `(0, 0, height)` |
+| joint | freejoint `ball_free` |
+| geom | `ball_geom`, sphere, 반지름 0.1 |
+| 조명 | 아무 데나 하나 |
+
+#%% ex
+def drop_xml(height: float) -> str:
+    """높이 height 에서 공 하나가 떨어지는 MJCF 문자열."""
+    #>> 위 표대로 MJCF 문자열을 만들어 return
+    return f"""
+<mujoco model="drop">
+  <option timestep="0.002"/>
+  <worldbody>
+    <light pos="0 0 3"/>
+    <geom name="floor" type="plane" size="5 5 0.1"/>
+    <body name="ball" pos="0 0 {height}">
+      <freejoint name="ball_free"/>
+      <geom name="ball_geom" type="sphere" size="0.1"/>
+    </body>
+  </worldbody>
+</mujoco>"""
+    #<<
+
+#%% test
+_m = mujoco.MjModel.from_xml_string(drop_xml(1.0))
+check("body 2개 (world + ball)", _m.nbody == 2)
+check("geom 2개 (floor + ball_geom)", _m.ngeom == 2 and _m.geom("ball_geom").type[0] == mujoco.mjtGeom.mjGEOM_SPHERE)
+check("timestep 0.002", _m.opt.timestep == 0.002)
+check("공의 초기 위치", np.allclose(_m.body("ball").pos, [0, 0, 1.0]))
+check("freejoint 이름", _m.joint("ball_free").type[0] == mujoco.mjtJoint.mjJNT_FREE)
+
+#%% md
+### 먼저 예상해 보기
+
+1. 이 모델의 `nq`(위치 좌표 개수)와 `nv`(속도 좌표 개수)는 각각 몇일까요? 둘이 왜 다를까요?
+2. 공의 질량은 얼마일까요? MJCF 어디에도 질량을 쓰지 않았습니다.
+
+적어 본 다음 아래 셀을 실행합니다.
+
+#%% code
+m = mujoco.MjModel.from_xml_string(drop_xml(1.0))
+d = mujoco.MjData(m)
+print("nq =", m.nq, " nv =", m.nv)
+print("qpos0 =", m.qpos0, " ← [x y z | qw qx qy qz]")
+print("ball mass =", m.body("ball").mass, " (기본 밀도 1000 kg/m³ × 구 부피)", 1000 * 4 / 3 * np.pi * 0.1**3)
+media.show_image(render(m, d))
+
+#%% md
+`nq = 7`, `nv = 6` 입니다. 자유 물체의 자세는 쿼터니언 4개로 적지만 각속도는 3개면 되기 때문입니다. 이 차이 때문에 MuJoCo 에서는 `qpos` 를 그냥 `qpos += qvel * dt` 로 적분하면 안 됩니다(`mj_integratePos` 가 따로 있는 이유).
+
+### 문제 1-2. 시뮬레이션 돌리기
+
+`mj_step(m, d)` 를 한 번 부르면 `d.time` 이 `m.opt.timestep` 만큼 흐릅니다. `seconds` 동안 돌리면서 매 스텝 **직후** 의 시간과 공의 높이를 모아 돌려줍니다.
+
+#%% ex
+def simulate_height(m, d, seconds: float):
+    """seconds 동안 스텝을 밟고 (times, heights) 를 numpy 배열로 돌려준다. 공의 높이는 qpos[2]."""
+    n = round(seconds / m.opt.timestep)
+    #>> n 번 mj_step 하면서 d.time 과 d.qpos[2] 를 모은다
+    times, heights = [], []
+    for _ in range(n):
+        mujoco.mj_step(m, d)
+        times.append(d.time)
+        heights.append(d.qpos[2])
+    return np.array(times), np.array(heights)
+    #<<
+
+#%% md
+### 먼저 예상해 보기
+
+공이 바닥에 닿기 전까지 높이는 $z(t) = h - \tfrac12 g t^2$ 를 **정확히** 따를까요? MuJoCo 의 기본 적분기는 반암시적 오일러(semi-implicit Euler)입니다.
+
+$$v_{k+1} = v_k - g\,\Delta t, \qquad z_{k+1} = z_k + v_{k+1}\,\Delta t$$
+
+이 점화식을 $n$ 번 풀면 $z_n$ 은 어떤 식이 될까요? 연속 시간 해와 얼마나 차이 날까요? 아래 채점 셀이 답을 확인합니다.
+
+#%% test
+m = mujoco.MjModel.from_xml_string(drop_xml(1.0))
+d = mujoco.MjData(m)
+_t, _z = simulate_height(m, d, 0.3)
+_g, _dt = 9.81, m.opt.timestep
+_n = np.arange(1, len(_t) + 1)
+check("0.3초 = 150 스텝", len(_t) == 150 and abs(_t[-1] - 0.3) < 1e-9)
+check_close("이산 해  z_n = h - g·dt²·n(n+1)/2 와 일치", _z, 1.0 - _g * _dt**2 * _n * (_n + 1) / 2, atol=1e-9)
+print("   연속 해와의 차이(끝점):", _z[-1] - (1.0 - 0.5 * _g * _t[-1] ** 2), " ≈ -g·dt·t/2 =", -_g * _dt * _t[-1] / 2)
+_t, _z = simulate_height(m, d, 2.0)
+check("2초 뒤에는 바닥 위에 정지 (z ≈ 반지름)", abs(_z[-1] - 0.1) < 2e-3)
+print("   정지 높이:", _z[-1], " → 반지름 0.1 보다 살짝 낮다. MuJoCo 의 접촉은 '부드러운' 접촉이라 조금 파고든다 (Part 4).")
+
+#%% code
+m = mujoco.MjModel.from_xml_string(drop_xml(1.0))
+d = mujoco.MjData(m)
+media.show_video(record(m, d, 1.5), fps=30)
+
+#%% md
+**정리**
+
+- `MjModel` 은 컴파일된 상수, `MjData` 는 상태입니다. World 가 환경 4096 개를 돌릴 때도 모델은 하나이고 데이터만 4096 벌입니다.
+- 시뮬레이션 결과는 `timestep` 과 적분기에 따라 달라집니다. Spider 의 `robot.xml` 은 `timestep="0.0005" integrator="implicitfast"` 를 쓰고, World 는 이를 `0.001` 로 덮어씁니다(`diden_configs/sim_profiles/mujoco_warp/diden_spider.py`). "sim 끼리도 결과가 다르다" 는 말의 첫 번째 원인이 여기입니다.

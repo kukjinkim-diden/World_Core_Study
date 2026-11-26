@@ -1,0 +1,284 @@
+#%% md
+## Part 11 — `ManagerBasedRlEnv`: 전부 묶기
+
+이제 매니저 여섯 개를 한 환경으로 묶습니다. 이 Part 의 핵심은 `step()` 안의 **순서** 입니다. World 의 `ManagerBasedRlEnv.step` (`diden_env/env/manager_based_rl_env.py`)에서 계측·로그 코드를 걷어내면 다음이 남습니다.
+
+```
+step(action):
+  1. action_manager.process_action(action)
+  2. 물리: decimation 번 반복 { action_manager.apply_action();  sim.step() }
+  3. episode_length_buf += 1
+  4. reset_buf = termination_manager.compute()          ← 종료 판정
+  5. reward_buf = reward_manager.compute(dt=step_dt)    ← 보상
+  6. 리셋할 환경이 있으면:
+       a. 시간 초과(time_out & ~terminated) 환경의 "리셋 직전 critic 관측" 을 extras["terminal_obs"] 에 저장
+       b. _reset_idx(env_ids);  sim.forward()
+  7. command_manager.compute(dt=step_dt)
+  8. (우리가 추가) event_manager.apply("interval", dt=step_dt)
+  9. obs_buf = observation_manager.compute()            ← 관측
+  return obs_buf, reward_buf, terminated, time_outs, extras
+```
+
+### 먼저 예상해 보기
+
+1. 보상(5)을 리셋(6)보다 **먼저** 계산해야 하는 이유는?
+2. 관측(9)을 리셋(6)보다 **나중에** 계산하면, 방금 끝난 환경에 대해 돌려주는 `obs` 는 어느 에피소드의 것일까요? 그래도 되는 이유는?
+3. 6a 에서 리셋 직전 관측을 따로 챙기는 이유는? (Part 9 의 time_out 설명)
+
+<details><summary>답</summary>
+
+1. 보상은 "방금 한 행동의 결과" 에 대한 것입니다. 리셋하고 나면 공이 새 위치에 있어서 엉뚱한 상태의 보상이 계산됩니다.
+2. **새 에피소드의 첫 관측** 입니다. 환경이 스스로 리셋하므로(auto-reset) 학습 루프는 멈추지 않고 그 관측으로 다음 액션을 뽑으면 됩니다. 대신 끝난 에피소드의 마지막 상태는 `obs` 에 없습니다.
+3. 시간 초과는 실패가 아니므로 "계속했다면 받았을 가치" $V(s_{T})$ 를 더해 줘야 하는데, 그 $s_T$ 가 2번 때문에 `obs` 에서 사라졌습니다. 그래서 리셋하기 전에 따로 저장합니다.
+</details>
+
+`_reset_idx(env_ids)` 의 순서도 정해져 있습니다(`manager_based_rl_env.py` 의 `_reset_idx`).
+
+```
+_reset_idx(env_ids):
+  1. event_manager.apply("reset", env_ids)     ← 물리 상태를 새로 쓴다
+  2. 각 매니저의 reset(env_ids)                 ← 내부 버퍼를 비우고 로그를 돌려준다
+       observation → action → reward → command → event → termination
+  3. episode_length_buf[env_ids] = 0
+```
+
+### 설정 한 곳에 모으기
+
+지금까지 채점 셀에서 따로 만들었던 설정 클래스를 하나로 묶습니다. World 에서 이 역할을 하는 것이 `ManagerBasedRLEnvCfg` 를 상속한 환경 설정(예: `magnet_locomotion_env_cfg.py`)이고, sim profile 이 `dt` 와 `decimation` 을 정합니다.
+
+#%% code
+@configclass
+class SimCfg:
+    dt: float = 0.005                 # 물리 스텝 [s]   (Spider: 0.001)
+    device: str = DEVICE
+
+
+@configclass
+class SceneCfg:
+    num_envs: int = 4096              # (Spider: 4096)
+
+
+@configclass
+class BallEnvCfg:
+    seed: int = 0
+    decimation: int = 4               # 정책 한 스텝 = 물리 4 스텝 → 50 Hz   (Spider: 10 → 100 Hz)
+    episode_length_s: float = 8.0     # (Spider: 40)
+    sim: SimCfg = SimCfg()
+    scene: SceneCfg = SceneCfg()
+    commands: CommandsCfg = CommandsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    observations: ObservationsCfg = ObservationsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    events: EventsCfg = EventsCfg()
+
+#%% md
+### 문제 11-1. 환경
+
+`__init__` 과 속성은 주어져 있습니다. `step`, `_reset_idx`, `reset` 을 채웁니다.
+
+- `extras` 는 사전입니다. `_reset_idx` 는 매니저들의 `reset()` 이 돌려준 로그 사전을 모아 `self.extras["log"]` 에 넣습니다.
+- `extras["terminal_obs"]` 는 `{"env_ids": 텐서, "obs": critic 관측}` 이고, 시간 초과 환경이 없는 스텝에서는 키 자체가 없어야 합니다.
+- `reset()` 은 모든 환경을 리셋하고 `(obs, extras)` 를 돌려줍니다.
+
+#%% ex
+class ManagerBasedRlEnv:
+    """(World: diden_env/env/manager_based_env.py + manager_based_rl_env.py + diden_mjlab/env/mjwarp_env.py)"""
+
+    def __init__(self, cfg: BallEnvCfg):
+        self.cfg = cfg
+        torch.manual_seed(cfg.seed)
+        # 씬 → 시뮬레이션 → 어댑터   (World: create_scene, create_sim_context, _create_sim_adapter)
+        self.sim = BatchedSim(build_ball_scene(timestep=cfg.sim.dt).compile(), cfg.scene.num_envs, cfg.sim.device)
+        self.sim_adapter = SimAdapter(self.sim)
+        # 버퍼
+        self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.common_step_counter = 0
+        self.extras: dict = {}
+        self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.reward_buf = torch.zeros(self.num_envs, device=self.device)
+        # 매니저   (World: load_managers — event 가 가장 먼저, 그다음 command → action → observation → termination → reward)
+        self.event_manager = EventManager(cfg.events, self)
+        self.command_manager = CommandManager(cfg.commands, self)
+        self.action_manager = ActionManager(cfg.actions, self)
+        self.observation_manager = ObservationManager(cfg.observations, self)
+        self.termination_manager = TerminationManager(cfg.terminations, self)
+        self.reward_manager = RewardManager(cfg.rewards, self)
+        self.event_manager.apply("startup")
+        self.obs_buf: dict = {}
+
+    # ── 속성 ───────────────────────────────────────────────
+    @property
+    def num_envs(self) -> int:
+        return self.cfg.scene.num_envs
+
+    @property
+    def device(self) -> str:
+        return self.cfg.sim.device
+
+    @property
+    def physics_dt(self) -> float:
+        return self.cfg.sim.dt
+
+    @property
+    def step_dt(self) -> float:
+        return self.cfg.sim.dt * self.cfg.decimation
+
+    @property
+    def max_episode_length_s(self) -> float:
+        return self.cfg.episode_length_s
+
+    @property
+    def max_episode_length(self) -> int:
+        return math.ceil(self.max_episode_length_s / self.step_dt)
+
+    @property
+    def num_actions(self) -> int:
+        return self.action_manager.total_action_dim
+
+    # ── MDP ────────────────────────────────────────────────
+    def _reset_idx(self, env_ids: torch.Tensor) -> None:
+        #>> reset 이벤트 → 매니저들 reset (로그를 extras["log"] 에 모음) → episode_length_buf 0
+        self.event_manager.apply("reset", env_ids=env_ids)
+        log = {}
+        for manager in (self.observation_manager, self.action_manager, self.reward_manager,
+                        self.command_manager, self.event_manager, self.termination_manager):
+            log.update(manager.reset(env_ids))
+        self.extras["log"] = log
+        self.episode_length_buf[env_ids] = 0
+        #<<
+
+    def reset(self) -> tuple[dict, dict]:
+        #>> 전체 환경 _reset_idx → sim.forward() → 관측
+        self._reset_idx(torch.arange(self.num_envs, device=self.device))
+        self.sim.forward()
+        self.obs_buf = self.observation_manager.compute()
+        return self.obs_buf, self.extras
+        #<<
+
+    def step(self, action: torch.Tensor):
+        #>> 위의 1~9 를 순서대로
+        # 1. 액션 처리
+        self.action_manager.process_action(action)
+        # 2. 물리
+        for _ in range(self.cfg.decimation):
+            self.action_manager.apply_action()
+            self.sim.step()
+        # 3. 카운터
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+        # 4. 종료 판정
+        self.reset_buf = self.termination_manager.compute()
+        terminated = self.termination_manager.terminated.clone()
+        time_outs = self.termination_manager.time_outs.clone()
+        # 5. 보상
+        self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
+        # 6. 리셋
+        self.extras.pop("terminal_obs", None)
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            timeout_env_ids = (time_outs & ~terminated).nonzero(as_tuple=False).squeeze(-1)
+            if len(timeout_env_ids) > 0:
+                critic_obs = self.observation_manager.compute_group("critic")
+                self.extras["terminal_obs"] = {"env_ids": timeout_env_ids, "obs": critic_obs[timeout_env_ids].clone()}
+            self._reset_idx(reset_env_ids)
+            self.sim.forward()
+        # 7. 명령
+        self.command_manager.compute(dt=self.step_dt)
+        # 8. interval 이벤트
+        self.event_manager.apply("interval", dt=self.step_dt)
+        # 9. 관측
+        self.obs_buf = self.observation_manager.compute()
+        return self.obs_buf, self.reward_buf, terminated, time_outs, self.extras
+        #<<
+
+#%% test
+env = ManagerBasedRlEnv(BallEnvCfg(scene=SceneCfg(num_envs=1024)))
+check("시간: 물리 0.005 s × decimation 4 = 0.02 s, 에피소드 400 스텝", abs(env.step_dt - 0.02) < 1e-12 and env.max_episode_length == 400)
+obs, extras = env.reset()
+check("reset 이 돌려주는 관측", obs["actor"].shape == (1024, 9) and obs["critic"].shape == (1024, 10))
+check("리셋 후: 공은 ±2 안, 마찰은 0.3~1.0", env.sim_adapter.root_pos_w[:, :2].abs().max() <= 2.0 and 0.3 <= env.sim_adapter.geom_friction.min())
+check("extras['log'] 에 매니저 로그", "Episode_Reward/goal_tracking_fine" in extras["log"] and "Episode_Termination/time_out" in extras["log"])
+
+_zero = torch.zeros(1024, 2, device=DEVICE)
+obs, rew, terminated, time_outs, extras = env.step(_zero)
+check("step 의 반환 모양", obs["actor"].shape == (1024, 9) and rew.shape == (1024,) and terminated.dtype == torch.bool and time_outs.shape == (1024,))
+check("episode_length_buf 가 1 증가", (env.episode_length_buf == 1).all())
+
+# 액션 (1, 0) 을 10 스텝 → +x 로 가속
+_v0 = env.sim_adapter.root_lin_vel_w[:, 0].clone()
+for _ in range(10):
+    env.step(torch.tensor([[1.0, 0.0]], device=DEVICE).expand(1024, 2))
+_dv = env.sim_adapter.root_lin_vel_w[:, 0] - _v0
+print(f"   0.2초 동안 속도 변화 평균 {_dv.mean():.3f} m/s  (τ/(1.4 m r)·0.2 = {0.2 / 0.28:.3f})")
+check("액션이 물리에 반영됨", 0.6 < _dv.mean() < 0.8)
+
+# 경기장 밖으로 내보내기 → terminated, 자동 리셋
+_ids = torch.tensor([3, 5], device=DEVICE)
+env.sim_adapter.write_root_state(_ids, torch.tensor([[6.0, 0.0, 0.2]], device=DEVICE).expand(2, 3),
+                                 torch.tensor([[1.0, 0, 0, 0]], device=DEVICE).expand(2, 4), torch.zeros(2, 3, device=DEVICE), torch.zeros(2, 3, device=DEVICE))
+obs, rew, terminated, time_outs, extras = env.step(_zero)
+check("밖으로 나간 환경은 terminated (time_out 아님)", terminated[_ids].all() and not time_outs[_ids].any() and terminated.sum() == 2)
+check("그 환경은 이미 리셋되어 있음: 길이 0, 위치 ±2", (env.episode_length_buf[_ids] == 0).all() and env.sim_adapter.root_pos_w[_ids, :2].abs().max() <= 2.0)
+check("돌려준 obs 는 새 에피소드의 것 (직전 액션 칸이 0)", obs["critic"][_ids, 7:9].abs().sum() == 0)
+check("terminated 만 있을 때는 terminal_obs 가 없다", "terminal_obs" not in extras)
+check_close("종료 로그", extras["log"]["Episode_Termination/out_of_bounds"], 1.0)
+
+# 시간 초과까지 돌리기
+env = ManagerBasedRlEnv(BallEnvCfg(scene=SceneCfg(num_envs=1024)))
+env.reset()
+_zero = torch.zeros(1024, 2, device=DEVICE)
+for _ in range(399):
+    obs, rew, terminated, time_outs, extras = env.step(_zero)
+_alive = env.episode_length_buf == 399           # 중간에 밖으로 나가 리셋된 적이 없는 환경
+check("399 스텝째: 아직 시간 초과 없음", not time_outs.any())
+print(f"   액션 0 으로 399 스텝을 버틴 환경: {int(_alive.sum())} / 1024  (나머지는 걷어차여 굴러가다 밖으로 나감)")
+obs, rew, terminated, time_outs, extras = env.step(_zero)
+check("400 스텝째: 버틴 환경은 전부 time_out", time_outs[_alive].all() and not time_outs[~_alive].any())
+_pure = time_outs & ~terminated                   # 같은 스텝에 밖으로도 나갔다면 terminated 가 우선
+check("terminal_obs: 순수 시간 초과 환경의 리셋 직전 critic 관측", torch.equal(extras["terminal_obs"]["env_ids"], _pure.nonzero().squeeze(-1))
+      and extras["terminal_obs"]["obs"].shape == (int(_pure.sum()), 10) and _pure.sum() > 0)
+check("자동 리셋됨", (env.episode_length_buf[_alive] == 0).all())
+check("마지막 스텝의 보상은 리셋 전 상태로 계산됨 (0 이 아님)", (rew[_alive] > 0).all())
+print(f"   액션 0 으로 8초: 에피소드 보상 합의 평균 = coarse {extras['log']['Episode_Reward/goal_tracking_coarse']:.3f}, fine {extras['log']['Episode_Reward/goal_tracking_fine']:.3f}")
+
+# 같은 seed → 같은 결과
+def _rollout(seed):
+    e = ManagerBasedRlEnv(BallEnvCfg(seed=seed, scene=SceneCfg(num_envs=256)))
+    o, _ = e.reset()
+    g = torch.Generator(device=DEVICE).manual_seed(123)
+    for _ in range(30):
+        o, r, *_ = e.step(torch.randn(256, 2, device=DEVICE, generator=g))
+    return o["critic"], r
+
+_o1, _r1 = _rollout(0); _o2, _r2 = _rollout(0); _o3, _ = _rollout(1)
+check_close("같은 seed 면 30 스텝 뒤 관측이 같음", _o1, _o2, atol=1e-5)
+check("다른 seed 면 다름", (_o1 - _o3).abs().max() > 0.1)
+
+#%% md
+### 속도 재기
+
+#%% code
+env = ManagerBasedRlEnv(BallEnvCfg())
+env.reset()
+_a = torch.zeros(env.num_envs, 2, device=DEVICE)
+for _ in range(5):
+    env.step(_a)
+wp.synchronize(); _t = time.time()
+for _ in range(100):
+    env.step(_a)
+wp.synchronize(); _dt = time.time() - _t
+print(f"환경 {env.num_envs} 개 × 100 스텝: {_dt:.2f} 초  →  초당 {env.num_envs * 100 / _dt:,.0f} 환경 스텝 (물리 스텝으로는 ×{env.cfg.decimation})")
+
+#%% md
+**실제 코드에서는** `step()` 에 다음이 더 있습니다. 이름을 알아 두면 진짜 코드를 읽을 때 길을 잃지 않습니다.
+
+- `self.cache.invalidate()` — `SimAdapter` 의 캐시 무효화 (Part 3)
+- `self.sensor_latency.*` — 센서 지연 모델. 물리 서브스텝마다 센서값을 테이프에 기록해 두고 관측에서 "몇 ms 전 값" 을 읽습니다
+- `_compute_all_regime_masks()` — 보상 항의 regime 판정 (Part 8)
+- `custom_managers` 의 `advance()` — `LocomotionManager`(보행 위상과 발 궤적), `ContactManager`(접촉 센서). 종료·보상보다 먼저 갱신됩니다
+- `curriculum_manager.compute()` — 리셋 때 난이도 조정
+- `extras["learning_valid"]` — 리셋 직후 워밍업 구간의 표본을 학습에서 빼는 마스크
+- `_profile_step` — 단계별 시간 측정. 학습이 느릴 때 어디가 병목인지 볼 수 있습니다
+
+그리고 World 의 환경은 세 클래스에 나뉘어 있습니다. `ManagerBasedEnv`(엔진과 무관한 공통 뼈대)와 `ManagerBasedRlEnv`(보상·종료·명령이 붙은 RL 환경)가 `diden-env` 패키지에 있고, 엔진에 닿는 부분(`create_scene`, `perform_physics_step`, `post_reset_sim_sync`)만 `diden-mjlab` 의 `MujocoWarpEnv` 가 구현합니다. 우리는 그 셋을 한 클래스에 합쳤습니다.

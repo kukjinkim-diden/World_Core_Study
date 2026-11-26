@@ -1,0 +1,55 @@
+# 스터디용 파이썬 환경. 물리/학습 라이브러리 버전은 DIDEN_World 의 pin 과 동일하게 맞춘다
+# (DIDEN_World/pyproject.toml 의 [tool.uv] 섹션 참고) — 노트북에서 직접 구현한 결과를
+# World 와 같은 엔진 위에서 비교하기 위함.
+#
+#   uv sync                      # .venv 생성
+#   uv run jupyter lab study/    # 노트북 열기
+[project]
+name = "world-core-study"
+version = "0.1.0"
+description = "DIDEN_World / DIDEN_Core 를 처음부터 직접 구현하며 이해하는 스터디 노트"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mujoco==3.15.0",
+    "mujoco-warp",
+    "warp-lang>=1.11.0.dev20251211",
+    "torch>=2.14",
+    "numpy>=2.0",
+    "matplotlib",
+    "mediapy",
+    "imageio[ffmpeg]",
+    "onnx>=1.22",
+    "onnxruntime>=1.27",
+    "onnxscript",
+    "pyyaml",
+    "jupyterlab",
+    "ipykernel",
+    "nbclient",
+    "nbformat",
+]
+
+[tool.uv]
+package = false
+# mujoco-warp 의 pyproject 가 mujoco 를 py.mujoco.org(nightly 전용)에서 찾게 하므로,
+# World 와 똑같이 override 로 PyPI 의 3.15.0 을 강제한다.
+override-dependencies = ["mujoco==3.15.0"]
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp", rev = "57b4692f4d3cdf4d27d916b4b8c4759ba36e9148" }
+warp-lang = { index = "nvidia" }
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

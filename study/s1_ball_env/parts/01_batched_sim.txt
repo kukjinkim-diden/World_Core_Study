@@ -1,0 +1,120 @@
+#%% md
+## Part 1 — `BatchedSim`: 환경 N 개를 GPU 에서 한꺼번에
+
+섹터 0 에서는 `MjData` 하나를 `mj_step` 으로 돌렸습니다. 강화학습은 표본이 많이 필요해서, World 는 같은 모델의 상태 4096 벌을 GPU 에 올려 한 번에 스텝을 밟습니다. 그 일을 하는 라이브러리가 `mujoco_warp` (줄여서 `mjw`) 입니다.
+
+```python
+model = mjw.put_model(mjm)                      # CPU 의 MjModel → GPU 모델 (환경들이 공유)
+data  = mjw.put_data(mjm, mjd, nworld=N)        # CPU 의 MjData 를 N 벌 복제한 GPU 데이터
+mjw.step(model, data)                           # N 개 world 를 한 스텝 전진
+mjw.forward(model, data)                        # mj_forward 의 배치판
+```
+
+`data.qpos` 는 모양이 `(N, nq)` 인 Warp 배열입니다. `wp.to_torch(data.qpos)` 를 부르면 **복사 없이** 같은 GPU 메모리를 가리키는 torch 텐서가 나옵니다. 이 텐서에 값을 쓰면 시뮬레이션 상태가 바뀝니다. 관측을 읽고, 리셋 때 상태를 써넣는 일을 전부 이 torch 뷰로 합니다.
+
+각 world 는 서로 **완전히 독립** 입니다. world 0 의 공과 world 1 의 공은 같은 좌표에 있어도 부딪히지 않습니다. 그래서 환경을 격자로 띄워 놓을 필요가 없습니다(World 에는 `env_origins` 격자가 있지만 리셋 기준점으로만 씁니다).
+
+### 문제 1-1. `BatchedSim`
+
+만들 것:
+
+- `__init__`: `put_model`, `put_data` 를 하고, 아래 torch 뷰를 속성으로 만든다.
+
+| 속성 | 원본 | 모양 |
+|---|---|---|
+| `qpos`, `qvel` | `data.qpos`, `data.qvel` | `(N, nq)`, `(N, nv)` |
+| `xpos`, `xquat` | `data.xpos`, `data.xquat` | `(N, nbody, 3)`, `(N, nbody, 4)` |
+| `xfrc_applied` | `data.xfrc_applied` | `(N, nbody, 6)` |
+| `mocap_pos` | `data.mocap_pos` | `(N, nmocap, 3)` |
+
+- `step()`, `forward()`
+
+`put_data` 에 넘길 `MjData` 는 `mj_forward` 를 한 번 해 둔 것이어야 `xpos` 등이 처음부터 맞습니다.
+
+#%% ex
+class BatchedSim:
+    """mujoco_warp 로 같은 모델의 world N 개를 GPU 에서 돌린다."""
+
+    def __init__(self, mjm: mujoco.MjModel, num_envs: int, device: str = DEVICE):
+        self.mjm = mjm
+        self.mjd = mujoco.MjData(mjm)          # CPU 쪽 사본. 초기 상태 제공과 렌더링에 쓴다.
+        mujoco.mj_forward(mjm, self.mjd)
+        self.num_envs = num_envs
+        self.device = device
+        #>> put_model / put_data 후 wp.to_torch 로 뷰를 만든다
+        with wp.ScopedDevice(device):
+            self.model = mjw.put_model(mjm)
+            self.data = mjw.put_data(mjm, self.mjd, nworld=num_envs)
+        self.qpos = wp.to_torch(self.data.qpos)
+        self.qvel = wp.to_torch(self.data.qvel)
+        self.xpos = wp.to_torch(self.data.xpos)
+        self.xquat = wp.to_torch(self.data.xquat)
+        self.xfrc_applied = wp.to_torch(self.data.xfrc_applied)
+        self.mocap_pos = wp.to_torch(self.data.mocap_pos)
+        #<<
+
+    @property
+    def dt(self) -> float:
+        return self.mjm.opt.timestep
+
+    def step(self) -> None:
+        #>> world 전체를 한 스텝
+        mjw.step(self.model, self.data)
+        #<<
+
+    def forward(self) -> None:
+        #>> qpos 를 직접 고친 뒤 파생량 갱신
+        mjw.forward(self.model, self.data)
+        #<<
+
+#%% test
+_t0 = time.time()
+sim = BatchedSim(mjm, num_envs=8)
+sim.step()
+print(f"   (첫 스텝까지 {time.time() - _t0:.1f} 초 — 처음이면 커널 컴파일 시간 포함)")
+check("qpos (N, 7), qvel (N, 6)", sim.qpos.shape == (8, 7) and sim.qvel.shape == (8, 6))
+check("xpos (N, nbody, 3), xfrc_applied (N, nbody, 6)", sim.xpos.shape == (8, mjm.nbody, 3) and sim.xfrc_applied.shape == (8, mjm.nbody, 6))
+check("mocap_pos (N, 1, 3)", sim.mocap_pos.shape == (8, 1, 3))
+check("GPU 텐서", sim.qpos.is_cuda)
+check("복사 없는 뷰: 같은 메모리를 가리킴", sim.qpos.data_ptr() == wp.to_torch(sim.data.qpos).data_ptr())
+
+# 뷰에 쓰면 시뮬레이션 상태가 바뀐다: world 마다 다른 높이에서 떨어뜨리기
+sim.qpos[:, 2] = torch.linspace(0.2, 1.6, 8, device=DEVICE)
+sim.forward()
+_bid = mjm.body("ball/sphere").id
+check_close("forward 후 xpos 가 qpos 를 따라감", sim.xpos[:, _bid, 2], torch.linspace(0.2, 1.6, 8))
+for _ in range(60):
+    sim.step()
+print("   0.3초 뒤 높이:", sim.qpos[:, 2])
+check("world 마다 다른 궤적 (서로 독립)", sim.qpos[:, 2].unique().numel() == 8)
+
+#%% md
+### 먼저 예상해 보기
+
+world 4096 개를 100 스텝 돌리는 데(= 공 40만 스텝) 몇 초가 걸릴까요? 섹터 0 의 CPU `mj_step` 은 이 씬에서 초당 수십만 스텝쯤 나옵니다. world 를 8 개로 줄이면 100 스텝에 걸리는 시간은 512 분의 1 이 될까요?
+
+#%% code
+def _steps_per_second(num_envs, n_steps=100):
+    s = BatchedSim(mjm, num_envs)
+    s.step()                                   # 워밍업
+    wp.synchronize()
+    t = time.time()
+    for _ in range(n_steps):
+        s.step()
+    wp.synchronize()                           # GPU 작업이 끝날 때까지 기다린 뒤 시간을 잰다
+    return time.time() - t
+
+for _n in (8, 512, 4096):
+    _dt = _steps_per_second(_n)
+    print(f"world {_n:5d} 개 × 100 스텝: {_dt * 1000:7.1f} ms   →  초당 {_n * 100 / _dt:12,.0f} 스텝")
+
+_d = mujoco.MjData(mjm)
+_t = time.time()
+for _ in range(20000):
+    mujoco.mj_step(mjm, _d)
+print(f"CPU mj_step (world 1 개):                       →  초당 {20000 / (time.time() - _t):12,.0f} 스텝")
+
+#%% md
+world 수를 512 배 늘려도 시간은 거의 늘지 않습니다. GPU 에서는 "한 스텝을 부르는 고정 비용" 이 크고 world 를 추가하는 비용은 작습니다. 그래서 환경 수는 GPU 메모리가 허락하는 만큼 키우고, 대신 **파이썬에서 world 를 하나씩 도는 반복문을 절대 쓰지 않는 것** 이 규칙입니다. 이 노트북의 모든 관측·보상·리셋 코드는 `(N, ...)` 텐서 연산으로 씁니다.
+
+World 는 여기서 한 걸음 더 나가 물리 스텝 묶음을 CUDA 그래프로 캡처해 호출 비용까지 줄입니다(`diden_mjlab/env/mjwarp_env.py` 의 `perform_physics_step`).

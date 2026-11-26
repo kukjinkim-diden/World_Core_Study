@@ -1,0 +1,158 @@
+#%% md
+## Part 16 — 평가와 영상
+
+학습 곡선이 올랐다고 정책이 좋은 것은 아닙니다. 보상은 우리가 임의로 정한 숫자이고, 원하는 것은 "목적지에 가서 멈춘다" 입니다. 그것을 직접 재는 지표를 따로 만듭니다.
+
+**성공** 을 이렇게 정의합니다: 목적지가 주어지고 3.8 초 뒤에, 공이 목적지 표시(반지름 0.25 m) 안에 있고 속력이 0.3 m/s 미만이다.
+
+평가용 환경은 학습용과 설정이 조금 다릅니다.
+
+- 목적지가 정확히 4 초마다 바뀝니다(`resampling_time_range=(4, 4)`). 에피소드 8 초 동안 목적지 2 개.
+- 걷어차기를 끕니다(`events.push_ball = None`). World 에서도 term 을 끄는 방법이 `None` 대입입니다.
+- 관측 노이즈는 그대로 둡니다. 실제 센서에도 노이즈가 있습니다.
+- 액션은 분포의 **평균** 을 씁니다(`deterministic=True`).
+
+### 문제 16-1. 성공률 재기
+
+`policy(obs_dict) -> actions` 형태의 함수를 받아 성공률을 잽니다. 정책이 신경망이든 손으로 짠 제어기든 같은 함수로 평가할 수 있게 합니다.
+
+- 190 번째 스텝(3.8 초) 직후와 390 번째 스텝(7.8 초) 직후에 성공 여부를 판정한다.
+- 그 사이에 한 번이라도 `terminated` 된 환경은 실패로 친다.
+- 돌려주는 값: `{"success_1": 첫 목적지 성공률, "success_2": 둘째 목적지 성공률, "terminated": 중간에 밖으로 나간 비율, "final_distance": 판정 시점 거리의 평균}`
+
+#%% ex
+def make_eval_cfg(num_envs: int = 2048, seed: int = 100, friction_range: tuple = (0.3, 1.0)) -> BallEnvCfg:
+    """(주어진 코드) 평가용 설정."""
+    cfg = BallEnvCfg(seed=seed, scene=SceneCfg(num_envs=num_envs))
+    cfg.commands.goal.resampling_time_range = (4.0, 4.0)
+    cfg.events.push_ball = None
+    cfg.events.randomize_friction.params["friction_range"] = friction_range
+    return cfg
+
+
+def is_success(env, distance_threshold: float = 0.25, speed_threshold: float = 0.3) -> torch.Tensor:
+    """(N,) bool: 목적지 안에 있고 거의 멈춰 있는가."""
+    #>> goal_distance 와 선속도 크기
+    speed = env.sim_adapter.root_lin_vel_w[:, :2].norm(dim=-1)
+    return (goal_distance(env) < distance_threshold) & (speed < speed_threshold)
+    #<<
+
+
+@torch.no_grad()
+def evaluate_policy(policy: Callable, cfg: BallEnvCfg = None) -> dict:
+    env = ManagerBasedRlEnv(cfg if cfg is not None else make_eval_cfg())
+    obs, _ = env.reset()
+    ever_terminated = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    result, distances = {}, []
+    for step in range(1, 391):
+        #>> 정책으로 한 스텝. ever_terminated 갱신. step 이 190, 390 이면 성공률을 result 에 기록
+        obs, _, terminated, _, _ = env.step(policy(obs))
+        ever_terminated |= terminated
+        if step in (190, 390):
+            ok = is_success(env) & ~ever_terminated
+            result["success_1" if step == 190 else "success_2"] = ok.float().mean().item()
+            distances.append(goal_distance(env)[~ever_terminated])
+        #<<
+    result["terminated"] = ever_terminated.float().mean().item()
+    result["final_distance"] = torch.cat(distances).mean().item()
+    return result
+
+#%% test
+_r = evaluate_policy(lambda obs: torch.zeros(obs["actor"].shape[0], 2, device=DEVICE), make_eval_cfg(num_envs=512))
+print("   액션 0:", {k: round(v, 3) for k, v in _r.items()})
+check("결과 키", set(_r) == {"success_1", "success_2", "terminated", "final_distance"})
+check("아무것도 안 하면 성공률은 거의 0", _r["success_1"] < 0.05 and _r["success_2"] < 0.05)
+
+#%% md
+### 비교 대상: 손으로 짠 PD 제어기
+
+학습된 정책이 얼마나 좋은지 알려면 기준이 필요합니다. 섹터 0 Part 6 의 PD 를 여기에 그대로 씁니다. 목적지까지의 상대 위치가 "오차", 속도가 "오차의 변화율" 입니다.
+
+$$\mathbf a = k_p \cdot (\text{목적지} - \text{공}) - k_d \cdot \mathbf v$$
+
+관측 벡터에서 필요한 칸을 직접 잘라 씁니다. actor 관측의 배치는 `[선속도 2 | 각속도 3 | 목적지 상대 위치 2 | 직전 액션 2]` 입니다.
+
+### 먼저 예상해 보기
+
+PD 제어기는 마찰이 1.0 인 바닥과 0.3 인 바닥에서 똑같이 잘할까요? 게인을 한 벌만 쓸 수 있다면 어느 쪽에 맞춰야 할까요?
+
+#%% code
+def pd_policy(kp: float, kd: float) -> Callable:
+    def policy(obs: dict) -> torch.Tensor:
+        o = obs["actor"]
+        return kp * o[:, 5:7] - kd * o[:, 0:2]
+    return policy
+
+
+for _kp, _kd in [(1.0, 1.0), (2.0, 1.5), (4.0, 2.0)]:
+    _row = [f"kp={_kp} kd={_kd}:"]
+    for _name, _fr in (("마찰 0.3~1.0", (0.3, 1.0)), ("마찰 0.3 만", (0.3, 0.3001)), ("마찰 1.0 만", (0.9999, 1.0))):
+        _r = evaluate_policy(pd_policy(_kp, _kd), make_eval_cfg(num_envs=1024, friction_range=_fr))
+        _row.append(f"{_name} → 성공 {(_r['success_1'] + _r['success_2']) / 2:.2f}, 이탈 {_r['terminated']:.2f}")
+    print("  ".join(_row))
+
+#%% md
+### 학습된 정책 평가
+
+#%% code slow
+def trained_policy(actor_critic: ActorCritic) -> Callable:
+    actor_critic.eval()                                      # 정규화 통계 고정
+    return lambda obs: actor_critic.act(obs["actor"], deterministic=True)
+
+
+for _name, _fr in (("마찰 0.3~1.0", (0.3, 1.0)), ("마찰 0.3 만", (0.3, 0.3001)), ("마찰 1.0 만", (0.9999, 1.0))):
+    _r = evaluate_policy(trained_policy(runner.actor_critic), make_eval_cfg(friction_range=_fr))
+    print(f"학습된 정책, {_name}: 성공 {(_r['success_1'] + _r['success_2']) / 2:.3f}  이탈 {_r['terminated']:.3f}  판정 시점 거리 {_r['final_distance']:.3f} m")
+eval_result = evaluate_policy(trained_policy(runner.actor_critic))
+
+#%% test slow
+check(f"첫 목적지 성공률 {eval_result['success_1']:.3f} > 0.9", eval_result["success_1"] > 0.9)
+check(f"둘째 목적지 성공률 {eval_result['success_2']:.3f} > 0.9", eval_result["success_2"] > 0.9)
+check("경기장 이탈 < 1 %", eval_result["terminated"] < 0.01)
+
+#%% md
+### 영상으로 보기
+
+GPU 의 world 하나를 골라 그 상태를 CPU 의 `MjData` 에 복사하고 섹터 0 의 `mujoco.Renderer` 로 그립니다. World 의 `dw play` 도 같은 방식입니다(`diden_mjlab/env/native_visualizer.py`). 아래는 주어진 코드입니다.
+
+#%% code slow
+@torch.no_grad()
+def record_policy(policy: Callable, cfg: BallEnvCfg, env_ids=(0, 1, 2, 3), steps: int = 400, every: int = 2, size=(360, 360)):
+    """env_ids 환경들을 각각 영상으로 만든다. 프레임 목록의 리스트를 돌려준다."""
+    env = ManagerBasedRlEnv(cfg)
+    obs, _ = env.reset()
+    mjm_, mjd_ = env.sim.mjm, mujoco.MjData(env.sim.mjm)
+    frames = [[] for _ in env_ids]
+    cam = make_camera(lookat=(0, 0, 0), distance=8.5, azimuth=90, elevation=-89)        # 위에서 내려다보기
+    with mujoco.Renderer(mjm_, size[1], size[0]) as renderer:
+        for step in range(steps):
+            obs, *_ = env.step(policy(obs))
+            if step % every:
+                continue
+            qpos, mocap = env.sim.qpos[list(env_ids)].cpu().numpy(), env.sim.mocap_pos[list(env_ids)].cpu().numpy()
+            for k in range(len(env_ids)):
+                mjd_.qpos[:] = qpos[k]
+                mjd_.mocap_pos[:] = mocap[k]
+                mujoco.mj_forward(mjm_, mjd_)
+                renderer.update_scene(mjd_, camera=cam)
+                frames[k].append(renderer.render())
+    return frames
+
+
+_cfg = make_eval_cfg(num_envs=16, seed=7)
+print("학습된 정책 (환경 4개, 위에서 본 모습. 초록 원이 목적지이고 4초에 한 번 바뀝니다)")
+media.show_videos(record_policy(trained_policy(runner.actor_critic), _cfg), fps=25, columns=4)
+print("PD 제어기 kp=2, kd=1.5 (같은 seed → 같은 시작 위치와 목적지)")
+media.show_videos(record_policy(pd_policy(2.0, 1.5), _cfg), fps=25, columns=4)
+
+#%% md
+**부숴 보기** (각각 설정 한두 줄만 바꿔 다시 학습하고, 실행 전에 결과를 예상해 봅니다)
+
+1. `RewardsCfg` 에서 `goal_tracking_coarse = None` 으로 끄면? fine 만으로 학습이 될까요?
+2. 두 추종 항의 `weight` 를 음수 거리(`-d`)로 바꾸고 mul 벌점을 add 벌점으로 바꾸면(Part 8 의 (가) 설계) `out_of_bounds` 비율은 어떻게 될까요?
+3. `TerminationsCfg` 에서 `time_out` 의 `time_out=True` 를 `False` 로 바꾸면(시간 초과를 실패로 취급) 가치 손실 곡선이 어떻게 달라질까요?
+4. `randomize_friction` 의 범위를 `(1.0, 1.0)` 으로 고정해 학습한 정책을 마찰 0.3 에서 평가하면? 반대로 `(0.1, 1.0)` 으로 넓히면?
+5. `ActionsCfg` 의 `scale` 을 5.0 으로 키우면? `decimation` 을 1 로(정책 200 Hz) 또는 20 으로(정책 10 Hz) 바꾸면?
+6. actor 에서 `ball_lin_vel` 을 빼면(속도를 직접 못 봄) 정책은 멈출 수 있을까요? 각속도만으로 속도를 알 수 있는 경우와 없는 경우는?
+
+4번이 도메인 랜덤화가 왜 필요한지, 6번이 Spider 에 상태 추정기가 왜 있는지를 직접 보여 줍니다.

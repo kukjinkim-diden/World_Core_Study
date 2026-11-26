@@ -1,0 +1,193 @@
+#%% md
+## Part 5 — 관절과 기구학 트리: Spider 다리 한 개
+
+로봇은 body 가 부모-자식으로 이어진 **트리** 입니다. 자식 body 의 `pos` 는 부모 좌표계 기준이고, 자식 안에 쓴 `<joint>` 가 "부모에 대해 어떻게 움직이는가" 를 정합니다.
+
+Spider 의 다리 하나는 모터 3개(엉덩이 yaw, 허벅지, 종아리)와 수동 발목 3개로 되어 있습니다. `robot.xml` 의 앞왼쪽(FL) 다리에서 모터 관절만 뽑으면 이렇습니다.
+
+```
+Torso
+└─ Leg_FL_Link_01   pos = ( 0.10675, 0.10675,  0.0875)   joint Leg_FL_Joint_01  axis z   ← 엉덩이 yaw
+   └─ Leg_FL_Link_02   pos = ( 0.0845, 0,  0.066)        joint Leg_FL_Joint_02  axis x   ← 허벅지
+      └─ Leg_FL_Link_03   pos = (-0.0865, 0, -0.383)     joint Leg_FL_Joint_03  axis x   ← 종아리
+         └─ site Foot_FL_Tip_site   pos = (0, 0, -0.4821)                                ← 발끝
+```
+
+### XML 대신 `MjSpec`
+
+지금까지는 MJCF 를 문자열로 썼습니다. MuJoCo 3 부터는 같은 것을 파이썬 객체로 조립하는 `MjSpec` 이 있고, World 는 **씬을 전부 `MjSpec` 으로** 만듭니다(Part 8). 대응 관계는 단순합니다.
+
+| MJCF | MjSpec |
+|---|---|
+| `<body name=.. pos=..>` (부모 안에) | `parent.add_body(name=.., pos=[..])` |
+| `<joint name=.. type="hinge" axis=..>` | `body.add_joint(name=.., type=mujoco.mjtJoint.mjJNT_HINGE, axis=[..])` |
+| `<geom type="capsule" fromto=.. size=..>` | `body.add_geom(type=mujoco.mjtGeom.mjGEOM_CAPSULE, fromto=[..], size=[r, 0, 0])` |
+| `<site name=.. pos=..>` | `body.add_site(name=.., pos=[..])` |
+| `<option timestep=..>` | `spec.option.timestep = ..` |
+| `<compiler angle="radian">` | `spec.compiler.degree = False` |
+| 컴파일 | `model = spec.compile()` |
+
+**함정**: MJCF 와 `MjSpec` 모두 각도의 기본 단위가 **도(degree)** 입니다. `robot.xml` 이 첫머리에 `<compiler angle="radian">` 을 쓰는 이유입니다. `MjSpec` 에서 `spec.compiler.degree = False` 를 빼먹고 `range=[-6.28, 6.28]` 을 쓰면 관절이 ±6.28° 안에 갇힙니다.
+
+### 문제 5-1. 다리 한 개 조립
+
+`MjSpec` 으로 위 트리를 만듭니다.
+
+- `spec.compiler.degree = False`, `timestep = 0.001`, 적분기 `implicitfast` (`mujoco.mjtIntegrator.mjINT_IMPLICITFAST`)
+- `Torso`: 세계에 **고정** (관절 없음), 위치 `(0, 0, 1.0)`. 상자 geom 하나(크기 자유).
+- 관절 3개: hinge, 위 표의 축, `range = [-6.28, 6.28]`, `armature = 0.235786` (`joint.xml` 의 `diden_actuator_v2`)
+- 링크 geom: 캡슐로 대략 그리면 됩니다. 질량은 `mass=` 로 직접 줍니다 — Link_01: 2.246938, Link_02: 2.5932, Link_03: 0.452306 kg.
+- 모든 geom 은 `contype=0, conaffinity=0` (이 Part 에서는 충돌을 쓰지 않습니다)
+- site `Foot_FL_Tip_site`
+
+#%% ex
+LEG_OFFSETS = {                      # robot.xml 의 Leg_FL_* 값
+    "Leg_FL_Link_01": (0.10675, 0.10675, 0.0875),
+    "Leg_FL_Link_02": (0.0845, 0.0, 0.066),
+    "Leg_FL_Link_03": (-0.0865, 0.0, -0.383),
+    "Foot_FL_Tip_site": (0.0, 0.0, -0.4821),
+}
+LEG_JOINT_AXES = {"Leg_FL_Joint_01": (0, 0, 1), "Leg_FL_Joint_02": (1, 0, 0), "Leg_FL_Joint_03": (1, 0, 0)}
+LEG_LINK_MASSES = {"Leg_FL_Link_01": 2.246938, "Leg_FL_Link_02": 2.5932, "Leg_FL_Link_03": 0.452306}
+MOTOR_ARMATURE = 0.235786
+
+
+def build_leg_spec() -> mujoco.MjSpec:
+    """Torso 가 공중에 고정된 FL 다리 한 개. (액추에이터는 Part 6 에서 붙인다.)"""
+    spec = mujoco.MjSpec()
+    #>> compiler/option 설정 → Torso → Link_01 → Link_02 → Link_03 → site 순으로 add_*
+    spec.compiler.degree = False
+    spec.option.timestep = 0.001
+    spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    G, J = mujoco.mjtGeom, mujoco.mjtJoint
+    nocol = dict(contype=0, conaffinity=0)
+
+    spec.worldbody.add_light(pos=[0, 0, 4])
+    torso = spec.worldbody.add_body(name="Torso", pos=[0, 0, 1.0])
+    torso.add_geom(name="torso_geom", type=G.mjGEOM_BOX, size=[0.17, 0.17, 0.05], rgba=[0.2, 0.2, 0.2, 1], **nocol)
+
+    parent, tip = torso, None
+    names = ["Leg_FL_Link_01", "Leg_FL_Link_02", "Leg_FL_Link_03"]
+    ends = [LEG_OFFSETS["Leg_FL_Link_02"], LEG_OFFSETS["Leg_FL_Link_03"], LEG_OFFSETS["Foot_FL_Tip_site"]]
+    for i, (name, end) in enumerate(zip(names, ends), start=1):
+        body = parent.add_body(name=name, pos=list(LEG_OFFSETS[name]))
+        jname = f"Leg_FL_Joint_0{i}"
+        body.add_joint(name=jname, type=J.mjJNT_HINGE, axis=list(LEG_JOINT_AXES[jname]),
+                       range=[-6.28, 6.28], armature=MOTOR_ARMATURE)
+        body.add_geom(name=f"{name}_geom", type=G.mjGEOM_CAPSULE, fromto=[0, 0, 0, *end], size=[0.02, 0, 0],
+                      mass=LEG_LINK_MASSES[name], rgba=[0.8, 0.5, 0.2, 1], **nocol)
+        parent = body
+    parent.add_site(name="Foot_FL_Tip_site", pos=list(LEG_OFFSETS["Foot_FL_Tip_site"]), size=[0.03, 0, 0], rgba=[1, 0, 0, 1])
+    #<<
+    return spec
+
+#%% test
+import warnings
+
+m_leg = build_leg_spec().compile()
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    m_ref = mujoco.MjModel.from_xml_path(str(ASSET / "robot" / "diden_spider_v2" / "robot.xml"))   # 진짜 로봇
+check("관절 3개, 자유도 3", m_leg.njnt == 3 and m_leg.nq == 3 and m_leg.nv == 3)
+check("Torso 는 세계에 고정", m_leg.body("Torso").jntnum[0] == 0)
+for _n in ("Leg_FL_Link_01", "Leg_FL_Link_02", "Leg_FL_Link_03"):
+    check_close(f"{_n} 위치가 robot.xml 과 같음", m_leg.body(_n).pos, m_ref.body(_n).pos)
+    check_close(f"{_n} 질량", m_leg.body(_n).mass, m_ref.body(_n).mass, atol=1e-6)
+for _n in LEG_JOINT_AXES:
+    check_close(f"{_n} 축", m_leg.joint(_n).axis, m_ref.joint(_n).axis)
+    check_close(f"{_n} 범위 (라디안!)", m_leg.joint(_n).range, m_ref.joint(_n).range)
+check_close("armature", m_leg.dof_armature, [MOTOR_ARMATURE] * 3)
+check_close("발끝 site", m_leg.site("Foot_FL_Tip_site").pos, m_ref.site("Foot_FL_Tip_site").pos)
+check("부모 관계", m_leg.body("Leg_FL_Link_03").parentid[0] == m_leg.body("Leg_FL_Link_02").id)
+
+#%% code
+d_leg = mujoco.MjData(m_leg)
+d_leg.qpos[:] = [0.6, -0.869, 0.994]
+mujoco.mj_forward(m_leg, d_leg)
+media.show_image(render(m_leg, d_leg, make_camera(lookat=(0.3, 0.2, 0.8), distance=2.2, azimuth=150)))
+
+#%% md
+### 정기구학을 손으로
+
+관절각 $q = (q_1, q_2, q_3)$ 가 주어졌을 때 발끝이 Torso 좌표계 어디에 있는지 구합니다. 트리를 따라 내려가며 "부모 좌표계에서 본 자식 원점 이동 → 관절 회전" 을 번갈아 곱하면 됩니다.
+
+$$p_{\text{tip}} = p_1 + R_z(q_1)\Big(p_2 + R_x(q_2)\big(p_3 + R_x(q_3)\,p_{\text{tip}}^{(3)}\big)\Big)$$
+
+Core 의 NMPC 와 RRT, World 의 `relative_foot_pos` 관측과 IK 리셋이 모두 이 식에서 출발합니다(`diden_common/robots/diden_spider/kinematics.py`).
+
+### 먼저 예상해 보기
+
+$q = (0, 0, 0)$ 일 때 발끝은 Torso 기준 어디에 있을까요? 표의 숫자만 더하면 됩니다.
+
+### 문제 5-2. 다리 정기구학
+
+#%% ex
+def rot_z(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def rot_x(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def leg_fk(q) -> np.ndarray:
+    """FL 다리 관절각 (3,) → Torso 좌표계에서 본 발끝 위치 (3,)."""
+    p1, p2, p3, pt = (np.array(LEG_OFFSETS[k]) for k in ("Leg_FL_Link_01", "Leg_FL_Link_02", "Leg_FL_Link_03", "Foot_FL_Tip_site"))
+    #>> 위 식 그대로
+    return p1 + rot_z(q[0]) @ (p2 + rot_x(q[1]) @ (p3 + rot_x(q[2]) @ pt))
+    #<<
+
+#%% test
+check_close("q=0: 오프셋의 합", leg_fk(np.zeros(3)), [0.10675 + 0.0845 - 0.0865, 0.10675, 0.0875 + 0.066 - 0.383 - 0.4821], atol=1e-12)
+_rng = np.random.default_rng(1)
+for _ in range(5):
+    _q = _rng.uniform(-1.5, 1.5, 3)
+    d_leg.qpos[:] = _q
+    mujoco.mj_forward(m_leg, d_leg)
+    _want = d_leg.site("Foot_FL_Tip_site").xpos - d_leg.body("Torso").xpos      # Torso 는 회전이 없으므로 빼기만 하면 된다
+    check_close(f"q={_q.round(2)}: MuJoCo 와 일치", leg_fk(_q), _want, atol=1e-10)
+
+#%% md
+### 야코비안
+
+발끝 속도와 관절 속도의 관계 $\dot p = J(q)\,\dot q$ 의 $J$ 가 야코비안입니다. 두 레포에서 계속 나옵니다.
+
+- 발에 걸리는 힘 $f$ 를 내려면 관절 토크 $\tau = J^\top f$ (Core NMPC 의 `τ_ff = −Jᵀf`)
+- 관절 토크에서 접촉력을 거꾸로 추정 (Core 추정기의 접촉 판정)
+- 역기구학의 반복 풀이 (Core 의 damped least squares)
+
+### 문제 5-3. 수치 야코비안
+
+`leg_fk` 를 중앙차분해서 3×3 야코비안을 만듭니다. MuJoCo 의 `mj_jacSite` 와 비교합니다.
+
+#%% ex
+def leg_jacobian(q, eps: float = 1e-6) -> np.ndarray:
+    """J[i, j] = ∂(발끝 위치 i) / ∂(q j).  중앙차분."""
+    q = np.asarray(q, dtype=float)
+    #>> 각 관절을 ±eps 흔들어 차분
+    J = np.zeros((3, 3))
+    for j in range(3):
+        dq = np.zeros(3)
+        dq[j] = eps
+        J[:, j] = (leg_fk(q + dq) - leg_fk(q - dq)) / (2 * eps)
+    return J
+    #<<
+
+#%% test
+_q = np.array([0.6, -0.869, 0.994])
+d_leg.qpos[:] = _q
+mujoco.mj_forward(m_leg, d_leg)
+_jacp = np.zeros((3, m_leg.nv))
+mujoco.mj_jacSite(m_leg, d_leg, _jacp, None, m_leg.site("Foot_FL_Tip_site").id)
+check_close("mj_jacSite 와 일치", leg_jacobian(_q), _jacp, atol=1e-7)
+_f = np.array([0.0, 0.0, 100.0])       # 발끝을 위로 100 N 미는 힘
+print("   발끝을 위로 100 N 밀 때 필요한 관절 토크 τ = Jᵀ f =", leg_jacobian(_q).T @ _f, "N·m")
+
+#%% md
+**정리**
+
+- body 트리 + 관절 축 + 오프셋이 기구학의 전부입니다. `robot.xml` 을 읽을 때 `pos` 와 `axis` 만 따라가면 로봇의 형태가 나옵니다.
+- 각도 단위(도/라디안)는 컴파일러 설정입니다.
+- `armature` 는 감속기를 거쳐 관절축에서 본 **모터 회전자의 관성** 입니다. 링크 관성과 별개로 관절 공간 관성행렬의 대각에 더해집니다. 다음 Part 에서 이 값이 왜 중요한지 봅니다.

@@ -1,0 +1,143 @@
+#%% md
+## Part 8 — `MjSpec` 으로 씬 조립하기: 공 굴리기 씬
+
+실제 씬은 파일 하나로 쓰지 않습니다. 바닥, 로봇, 구조물이 각자 파일로 있고 **실행할 때 조립** 합니다. World 의 조립 코드는 짧습니다(`diden_mjlab/scene/scene.py`).
+
+```python
+self._spec = mujoco.MjSpec.from_file(scene.xml)                 # 빈 씬 (조명·시각 설정만)
+self._spec.attach(terrain.spec, prefix="", frame=worldbody.add_frame())      # 지형
+self._spec.attach(ent.spec, prefix=f"{ent_name}/", frame=frame)             # 로봇·오브젝트마다
+model = self._spec.compile()
+```
+
+Core 도 같은 일을 C API 로 합니다(`src/engine/simulator/scene_manager.cpp` 의 `mjs_attach`).
+
+`attach` 의 규칙 세 가지:
+
+1. 붙는 쪽(child)의 모든 이름 앞에 `prefix` 가 붙습니다. `sphere` → `ball/sphere`. 로봇을 두 대 넣어도 이름이 겹치지 않습니다.
+2. child 는 `frame` 의 위치·자세에 놓입니다.
+3. `<option>` 은 **붙이는 쪽(parent)의 것만 남습니다.** child 파일에 적힌 timestep, 적분기 설정은 버려집니다.
+
+붙인 뒤에도 spec 은 고칠 수 있습니다. `spec.body("ball/sphere")` 로 body 를 찾아 관절을 달고, `body.geoms` 를 돌며 속성을 바꿉니다.
+
+### mocap body
+
+섹터 1 에서는 "목적지" 를 화면에 보여 줘야 합니다. 물리에는 참여하지 않고 **코드가 위치를 직접 정하는** 물체가 mocap body 입니다. `add_body(name=.., mocap=True)` 로 만들고, 위치는 `d.mocap_pos[i]` 에 써넣습니다. `qpos` 에는 들어가지 않습니다.
+
+### 문제 8-1. 공 굴리기 씬
+
+섹터 1 에서 그대로 쓸 씬입니다. `DIDEN_Asset/object/sphere.xml` 을 불러와 **굴러다니는 공** 으로 바꿉니다.
+
+| 항목 | 값 |
+|---|---|
+| `spec.option.timestep` | 인자 `timestep` (기본 0.005) |
+| 바닥 | geom `floor`, plane, `size=[0, 0, 0.05]` (0 이면 무한 평면), `friction=[floor_friction, 0.005, 0.0001]` |
+| 공 | `sphere.xml` 을 `prefix="ball/"` 로 attach. frame 위치 `(0, 0, 0.2)` (반지름 0.2 → 바닥에 딱 닿음) |
+| 공의 관절 | `ball/sphere` 에 freejoint, 이름 `ball/root` |
+| 공의 collision geom | 질량이 `ball_mass` 가 되는 밀도, `friction=[ball_friction, 0.005, 0.0001]` |
+| 목적지 | mocap body `goal`, 위치 `(1, 0, 0)`. geom `goal_marker`: cylinder, `size=[0.25, 0.005, 0]`, 반투명 초록, `contype=0`, `conaffinity=0` |
+| 조명 | 하나 |
+
+collision geom 과 visual geom 은 `contype` 으로 구분할 수 있습니다(visual 은 0).
+
+#%% ex
+BALL_RADIUS = 0.2
+
+
+def build_ball_scene(ball_mass: float = 1.0, ball_friction: float = 1.0, floor_friction: float = 1.0,
+                     timestep: float = 0.005) -> mujoco.MjSpec:
+    spec = mujoco.MjSpec()
+    spec.modelname = "ball_scene"
+    #>> option → 조명·바닥 → sphere.xml attach → freejoint·밀도·마찰 수정 → mocap goal
+    G = mujoco.mjtGeom
+    spec.option.timestep = timestep
+    wb = spec.worldbody
+    wb.add_light(name="sun", pos=[0, 0, 6], dir=[0, 0, -1], type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL)
+    wb.add_geom(name="floor", type=G.mjGEOM_PLANE, size=[0, 0, 0.05], friction=[floor_friction, 0.005, 0.0001])
+
+    child = mujoco.MjSpec.from_file(str(ASSET / "object" / "sphere.xml"))
+    spec.attach(child, prefix="ball/", frame=wb.add_frame(pos=[0, 0, BALL_RADIUS]))
+    ball = spec.body("ball/sphere")
+    ball.add_freejoint(name="ball/root")
+    for g in ball.geoms:
+        if g.contype:      # collision geom
+            g.density = ball_mass / (4.0 / 3.0 * np.pi * BALL_RADIUS**3)
+            g.friction = [ball_friction, 0.005, 0.0001]
+
+    goal = wb.add_body(name="goal", mocap=True, pos=[1, 0, 0])
+    goal.add_geom(name="goal_marker", type=G.mjGEOM_CYLINDER, size=[0.25, 0.005, 0], rgba=[0.1, 0.9, 0.2, 0.6],
+                  contype=0, conaffinity=0)
+    #<<
+    return spec
+
+#%% test
+_m = build_ball_scene(ball_mass=1.0, ball_friction=0.5, floor_friction=0.3).compile()
+check("body: world, ball/sphere, goal", {_m.body(i).name for i in range(_m.nbody)} == {"world", "ball/sphere", "goal"})
+check("freejoint ball/root 하나뿐 (nq=7, nv=6)", _m.njnt == 1 and _m.joint("ball/root").type[0] == mujoco.mjtJoint.mjJNT_FREE and _m.nq == 7)
+check_close("공 질량", _m.body("ball/sphere").mass, [1.0], atol=1e-9)
+check_close("공 관성 2/5 m r²", _m.body("ball/sphere").inertia, [0.016] * 3, atol=1e-9)
+check_close("공 마찰", _m.geom("ball/sphere_collision").friction, [0.5, 0.005, 0.0001])
+check_close("바닥 마찰", _m.geom("floor").friction, [0.3, 0.005, 0.0001])
+check("visual geom 은 그대로 (충돌·질량 없음)", _m.geom("ball/sphere_visual").contype[0] == 0)
+check("goal 은 mocap body", _m.nmocap == 1 and _m.body("goal").mocapid[0] == 0)
+check("goal_marker 는 충돌 안 함", _m.geom("goal_marker").contype[0] == 0 and _m.geom("goal_marker").conaffinity[0] == 0)
+check("timestep", _m.opt.timestep == 0.005)
+_d = mujoco.MjData(_m)
+for _ in range(200):
+    mujoco.mj_step(_m, _d)
+check("공이 바닥 위에 놓여 있음", abs(_d.qpos[2] - 0.2) < 2e-3 and _d.ncon == 1)
+
+# 토크로 굴리기: Part 4 의 해석해와 맞는가 (유효 마찰 = max(0.5, 0.3) = 0.5)
+_tau = 0.5 * max_torque_without_slip(0.5, 1.0, BALL_RADIUS)
+_d.xfrc_applied[_m.body("ball/sphere").id, 4] = _tau
+_v0 = _d.qvel[0]
+for _ in range(200):
+    mujoco.mj_step(_m, _d)
+check_close("y 축 토크 → +x 로 가속, a = τ / (7/5·m·r)", (_d.qvel[0] - _v0) / 1.0, predict_ball_accel_from_torque(_tau, 1.0, BALL_RADIUS), rtol=0.01)
+
+#%% md
+### 굴려 보기
+
+아래는 주어진 코드입니다. 바닥에 격자 무늬를 입히고(구르는 것이 보이도록), 목적지를 옮기고, 목적지 방향으로 토크를 걸어 굴립니다. 제어기는 "목적지 쪽으로 일정한 토크" 가 전부입니다.
+
+### 먼저 예상해 보기
+
+이 제어기로 공은 목적지에 **멈출** 수 있을까요? Part 4 의 마지막 "부숴 보기" 를 떠올려 봅니다.
+
+#%% code
+def add_grid_floor(spec: mujoco.MjSpec):
+    """바닥에 체커 무늬 재질을 입힌다 (보기 좋게 하는 용도. 물리는 그대로)."""
+    spec.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D, builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
+                     width=256, height=256, rgb1=[0.22, 0.24, 0.28], rgb2=[0.30, 0.32, 0.37])
+    mat = spec.add_material(name="grid", texrepeat=[1, 1])
+    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "grid"
+    spec.geom("floor").material = "grid"
+    return spec
+
+
+def torque_toward(m, d, goal_xy, magnitude: float):
+    """공에서 목적지를 향하는 방향 u 로 구르게 하는 세계 좌표계 토크를 xfrc_applied 에 쓴다.
+    +x 로 굴리려면 +y 토크, +y 로 굴리려면 −x 토크: τ = magnitude · (ẑ × u)."""
+    bid = m.body("ball/sphere").id
+    u = np.asarray(goal_xy) - d.xpos[bid][:2]
+    u = u / (np.linalg.norm(u) + 1e-9)
+    d.xfrc_applied[bid, 3:6] = magnitude * np.array([-u[1], u[0], 0.0])
+
+
+m_ball = add_grid_floor(build_ball_scene()).compile()
+d_ball = mujoco.MjData(m_ball)
+goal_xy = np.array([2.0, 1.0])
+d_ball.mocap_pos[0] = [*goal_xy, 0.0]
+frames = record(m_ball, d_ball, 4.0, camera=make_camera(lookat=(1.0, 0.5, 0.2), distance=5.0, azimuth=120, elevation=-30),
+                step_fn=lambda m, d: torque_toward(m, d, goal_xy, 0.5), groups=[0, 1, 2])
+media.show_video(frames, fps=30)
+print("4초 뒤 공 위치:", d_ball.body("ball/sphere").xpos[:2], " 목적지:", goal_xy, " 속도:", d_ball.qvel[:2])
+
+#%% md
+공은 목적지를 지나쳤다가 되돌아오기를 반복합니다. 멈추려면 속도를 보고 미리 반대 토크를 걸어야 합니다. 그 "언제 얼마나" 를 손으로 짜는 대신 학습시키는 것이 섹터 1 입니다.
+
+**정리**
+
+- 씬 = 빈 spec + `attach(child, prefix, frame)` 여러 번 + 수정 + `compile()`. World 의 `MujocoWarpScene`, Core 의 `scene_manager` 가 하는 일이 이것입니다.
+- attach 하면 이름에 prefix 가 붙습니다. World 에서 로봇의 body 는 전부 `robot/...` 입니다. 코드에서 이름으로 body 를 찾을 때 prefix 를 빼먹는 실수가 흔합니다.
+- 컴파일 **전** 에 고치는 것(spec: 관절 추가, geom 속성)과 컴파일 **후** 에 고치는 것(model: `m.geom_friction[...] = ...`)을 구분합니다. 구조를 바꾸는 일은 전에만 가능하고, 숫자 하나 바꾸는 일은 후에도 됩니다. 섹터 1 의 도메인 랜덤화는 후자입니다.

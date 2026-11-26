@@ -1,0 +1,228 @@
+#%% md
+## Part 9 — 진짜 로봇: Spider 불러와 세우기
+
+지금까지 만든 것을 모두 써서 `DIDEN_Asset/robot/diden_spider_v2/robot.xml` 을 읽습니다. 이 파일 하나를 World 와 Core 가 **같이** 씁니다(둘 다 `DIDEN_Asset` 을 서브모듈로 갖고 있습니다). 로봇의 물리값이 바뀌면 이 파일 한 곳만 고칩니다.
+
+#%% code
+import warnings
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    m_robot = mujoco.MjModel.from_xml_path(str(ASSET / "robot" / "diden_spider_v2" / "robot.xml"))
+print(f"body {m_robot.nbody}개 | 관절 {m_robot.njnt}개 | nq={m_robot.nq} nv={m_robot.nv} | 액추에이터 {m_robot.nu}개 | 센서 {m_robot.nsensor}개 | geom {m_robot.ngeom}개")
+print(f"전체 질량 {m_robot.body_subtreemass[m_robot.body('base').id]:.2f} kg | timestep {m_robot.opt.timestep} | 키프레임 {[m_robot.key(i).name for i in range(m_robot.nkey)]}")
+
+#%% md
+### 먼저 예상해 보기
+
+`nq = 37` 은 어떻게 나온 숫자일까요? 다리 4개, 다리마다 모터 3개와 수동 발목 3개, 그리고 6축 매니퓰레이터가 있습니다.
+
+### 문제 9-1. 기구학 트리 출력
+
+body 트리를 들여쓰기로 보여 주는 줄 목록을 만듭니다. 각 줄은
+
+```
+<깊이 × 공백 2칸><body 이름>            ← 관절이 없는 body
+<깊이 × 공백 2칸><body 이름> ← <관절 이름>, <관절 이름>
+```
+
+형식이고, `world` 가 깊이 0 입니다. 순서는 body id 순서(= MJCF 에 적힌 순서, 깊이 우선)를 그대로 따릅니다.
+
+필요한 배열: `m.body_parentid[b]`, `m.body_jntadr[b]`(첫 관절 id, 없으면 −1), `m.body_jntnum[b]`.
+
+#%% ex
+def tree_lines(m) -> list[str]:
+    lines = []
+    #>> body 0 부터 순서대로: 깊이는 부모 깊이 + 1
+    depth = np.zeros(m.nbody, dtype=int)
+    for b in range(m.nbody):
+        if b > 0:
+            depth[b] = depth[m.body_parentid[b]] + 1
+        joints = [m.joint(m.body_jntadr[b] + k).name for k in range(m.body_jntnum[b])]
+        lines.append("  " * depth[b] + m.body(b).name + (" ← " + ", ".join(joints) if joints else ""))
+    #<<
+    return lines
+
+#%% test
+_lines = tree_lines(m_robot)
+check("줄 수 = body 수", len(_lines) == m_robot.nbody)
+check("world", _lines[0] == "world")
+check("base 는 freejoint 'root'", _lines[1] == "  base ← root")
+check("Torso 는 base 에 고정", "    Torso" in _lines)
+check("엉덩이 관절", "      Leg_FL_Link_01 ← Leg_FL_Joint_01" in _lines)
+check("발목 roll 은 깊이 8", "  " * 8 + "Foot_FL_Link_03 ← Foot_FL_Joint_03" in _lines)
+print("\n".join(l for l in _lines if "Leg_FL" in l or "Foot_FL" in l or l.strip() in ("world", "Torso") or "base" in l))
+
+#%% md
+`Foot_FL_EPMForcePoint_01~04` 는 발바닥 네 귀퉁이에 있는 질량 0.01 g 짜리 body 입니다. 자석(EPM)이 당기는 힘을 `xfrc_applied` 로 걸 **작용점** 으로 쓰기 위해 body 로 만들어 둔 것입니다(Part 4 에서 본 대로 `xfrc_applied` 는 body 단위입니다). World 의 `diden_domain/magnet`, Core 의 `simulator.cpp` 가 둘 다 이 body 들에 힘을 겁니다.
+
+### 문제 9-2. 구동 관절의 순서
+
+정책이 내는 액션 벡터의 i 번째 칸이 어느 관절인가는 **액추에이터 순서** 로 정해집니다. 이 순서가 World(학습)와 Core(실행)에서 다르면 로봇은 엉뚱한 다리를 움직입니다. 순서를 뽑아 봅니다.
+
+액추에이터 `i` 가 구동하는 관절 id 는 `m.actuator_trnid[i, 0]` 입니다.
+
+#%% ex
+def actuated_joints(m):
+    """(관절 이름 리스트, qpos 주소 배열, qvel 주소 배열) — 액추에이터 순서."""
+    #>> actuator_trnid → joint → qposadr, dofadr
+    jids = [int(m.actuator_trnid[i, 0]) for i in range(m.nu)]
+    names = [m.joint(j).name for j in jids]
+    qadr = np.array([m.jnt_qposadr[j] for j in jids])
+    vadr = np.array([m.jnt_dofadr[j] for j in jids])
+    return names, qadr, vadr
+    #<<
+
+#%% test
+_names, _qadr, _vadr = actuated_joints(m_robot)
+check("18개 (다리 12 + 팔 6)", len(_names) == 18)
+check("다리 순서는 RR → RL → FR → FL", [n.split("_")[1] for n in _names[:12:3]] == ["RR", "RL", "FR", "FL"])
+check("팔이 마지막", _names[12:] == [f"Manipulator_Joint_0{i}" for i in range(1, 7)])
+check("수동 발목은 포함되지 않음", not any(n.startswith("Foot_") for n in _names))
+check("qpos 주소: 다리마다 발목 3칸을 건너뛴다", list(_qadr[:6]) == [7, 8, 9, 13, 14, 15])
+check("qvel 주소는 qpos 주소 − 1 (freejoint 가 7칸/6칸)", np.array_equal(_vadr, _qadr - 1))
+print("  ", _names[:12])
+
+#%% md
+### 문제 9-3. 로봇을 씬에 넣기
+
+`robot.xml` 을 `MjSpec` 으로 불러 바닥이 있는 씬에 붙입니다. World 의 `diden_mjlab/robots/diden_spider/spec.py` 가 하는 일의 축소판입니다.
+
+1. `MjSpec.from_file(robot.xml)` 로 불러온다.
+2. `robot.xml` 안에는 단독으로 열어 볼 때를 위한 보이지 않는 바닥 `__mjv_default_floor` 가 있다. 지운다: `spec.delete(spec.geom("__mjv_default_floor"))`. (World 의 `_strip_standalone_floor`)
+3. 새 씬 spec 을 만든다: 라디안, `timestep = 0.001`, `implicitfast`, 조명, plane 바닥 `floor`. 로봇이 어두운 색이라 바닥은 밝게 칠해 두면 보기 좋습니다(예: `rgba=[0.75, 0.75, 0.78, 1]`).
+4. `prefix="spider/"` 로 attach 한다.
+
+World 는 여기에 더해 키프레임 삭제, 모터 삭제 후 position 액추에이터 주입, 매니퓰레이터 용접 등을 합니다. 우리는 모터와 키프레임을 그대로 둡니다.
+
+#%% ex
+def build_spider_scene() -> mujoco.MjSpec:
+    #>> 위 1~4
+    robot = mujoco.MjSpec.from_file(str(ASSET / "robot" / "diden_spider_v2" / "robot.xml"))
+    robot.delete(robot.geom("__mjv_default_floor"))
+
+    scene = mujoco.MjSpec()
+    scene.compiler.degree = False
+    scene.option.timestep = 0.001
+    scene.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    scene.worldbody.add_light(name="sun", pos=[0, 0, 6], dir=[0, 0, -1], type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL)
+    scene.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 0.05], rgba=[0.75, 0.75, 0.78, 1])
+    scene.attach(robot, prefix="spider/", frame=scene.worldbody.add_frame())
+    return scene
+    #<<
+
+#%% test
+with warnings.catch_warnings(record=True) as _w:
+    warnings.simplefilter("always")
+    m_spider = build_spider_scene().compile()
+print("attach 가 낸 경고:\n  " + "\n  ".join(str(_w[0].message).splitlines()) if _w else "(경고 없음)")
+check("이름에 prefix", m_spider.body("spider/Torso").id > 0 and m_spider.joint("spider/root").type[0] == mujoco.mjtJoint.mjJNT_FREE)
+check("로봇의 숨은 바닥은 지워짐", "spider/__mjv_default_floor" not in [m_spider.geom(i).name for i in range(m_spider.ngeom)])
+check("우리 바닥이 있음", m_spider.geom("floor").type[0] == mujoco.mjtGeom.mjGEOM_PLANE)
+check("자유도는 그대로 (nq=37, nu=18)", m_spider.nq == 37 and m_spider.nu == 18)
+check("씬의 option 이 이김: timestep 0.001, noslip 0", m_spider.opt.timestep == 0.001 and m_spider.opt.noslip_iterations == 0)
+check("키프레임도 prefix 가 붙어 따라옴", m_spider.key("spider/stand_pose").id >= 0)
+
+#%% md
+경고를 읽어 봅니다. `robot.xml` 에 적힌 `timestep=0.0005`, `noslip_iterations=20`, `gravity=-9.80665` 가 **버려졌다** 는 내용입니다. attach 에서는 붙이는 쪽의 `<option>` 만 남기 때문입니다. "로봇 파일에 적힌 물리 설정" 과 "실제로 도는 물리 설정" 은 다를 수 있고, World 에서 실제 값은 sim profile(`diden_configs/sim_profiles/mujoco_warp/diden_spider.py`)이 정합니다.
+
+### 문제 9-4. 세우기
+
+키프레임 `stand_pose` 의 관절각을 목표로 PD 제어해 로봇을 세웁니다.
+
+1. `mujoco.mj_resetDataKeyframe(m, d, key_id)` 로 키프레임 상태로 만든다.
+2. 키프레임의 몸통 높이는 바닥 기준이 아니므로, 발바닥이 바닥에 닿도록 몸통을 옮긴다 → 주어진 `place_on_floor` 사용.
+3. 매 스텝 구동 관절 18개에 `pd_torque` 를 계산해 `d.ctrl` 에 넣는다. 목표는 키프레임의 관절각, 토크 한계는 `m.actuator_ctrlrange`.
+4. `seconds` 뒤 `(몸통 높이, 몸통 z축의 세계 z 성분)` 을 돌려준다. 두 번째 값은 똑바로 서 있으면 1, 옆으로 누우면 0 입니다 — `d.body("spider/Torso").xmat` 의 마지막 원소.
+
+### 먼저 예상해 보기
+
+World 의 기본 게인은 kp=100, kd=20 입니다. 이 게인으로 `stand_pose` 를 목표로 주면 57 kg 로봇이 설 수 있을까요? Part 6 의 "처짐 = 중력 토크 / kp" 를 떠올려 봅니다.
+
+#%% ex
+def place_on_floor(m, d, clearance: float = 0.002):
+    """(주어진 코드) 가장 낮은 발바닥 상자가 바닥에서 clearance 만큼 뜨도록 몸통을 위아래로 옮긴다."""
+    mujoco.mj_forward(m, d)
+    soles = [i for i in range(m.ngeom) if m.geom(i).name.endswith("Link_03_collision") and "Foot" in m.geom(i).name]
+    lowest = min(d.geom_xpos[i][2] - m.geom_size[i][2] for i in soles)
+    d.qpos[2] += clearance - lowest
+    mujoco.mj_forward(m, d)
+
+
+def stand(m, kp: float, kd: float, seconds: float = 4.0, key: str = "spider/stand_pose"):
+    """PD 로 키프레임 자세를 유지시키고 (몸통 높이, 몸통 up 성분, data) 를 돌려준다."""
+    d = mujoco.MjData(m)
+    #>> 키프레임 리셋 → place_on_floor → PD 루프 → 결과
+    kid = m.key(key).id
+    mujoco.mj_resetDataKeyframe(m, d, kid)
+    place_on_floor(m, d)
+    _, qadr, vadr = actuated_joints(m)
+    q_des = m.key_qpos[kid][qadr].copy()
+    limit = m.actuator_ctrlrange[:, 1]
+    for _ in range(round(seconds / m.opt.timestep)):
+        d.ctrl[:] = pd_torque(d.qpos[qadr], d.qvel[vadr], q_des, kp, kd, torque_limit=limit)
+        mujoco.mj_step(m, d)
+    torso = d.body("spider/Torso")
+    return float(torso.xpos[2]), float(torso.xmat[8]), d
+    #<<
+
+#%% test
+_z, _up, d_spider = stand(m_spider, kp=400.0, kd=20.0)
+print(f"   kp=400: 몸통 높이 {_z:.3f} m, up {_up:.3f}")
+check("kp=400 이면 선다", _up > 0.99 and _z > 0.4)
+_names, _qadr, _ = actuated_joints(m_spider)
+_err = m_spider.key_qpos[m_spider.key("spider/stand_pose").id][_qadr] - d_spider.qpos[_qadr]
+print("   다리 관절의 정상상태 오차 [rad]:", _err[:12].round(3))
+check("서 있을 때도 처짐은 남는다 (허벅지 관절 > 0.01 rad)", np.abs(_err[1:12:3]).min() > 0.01)
+media.show_image(render(m_spider, d_spider, make_camera(lookat=(0, 0, 0.35), distance=2.8, azimuth=140, elevation=-20), groups=[0, 1, 2]))
+
+_z, _up, _ = stand(m_spider, kp=100.0, kd=20.0)
+print(f"   kp=100: 몸통 높이 {_z:.3f} m, up {_up:.3f}")
+check("kp=100 으로 같은 목표를 주면 주저앉는다 — 예상과 같았나요?", _up < 0.9)
+
+#%% md
+kp=100 에서는 처짐이 커서 다리가 벌어지고, 벌어질수록 필요한 토크가 더 커져서 무너집니다. 그런데 World 는 kp=100 으로 이 로봇을 걷게 합니다. 가능한 이유가 Part 6 끝에서 말한 `action_offset` 입니다. PD 목표를 "서 있는 자세" 가 아니라 "처진 결과가 서 있는 자세가 되는 각도" 로 잡고, 나머지는 정책이 매 스텝 목표를 조정해 메웁니다. Core 의 NMPC 는 다른 길을 갑니다. 지지 다리는 게인을 낮추고(stance kp=0, kd=100) 필요한 힘을 피드포워드 토크 $\tau = -J^\top f$ 로 직접 넣습니다(`config/diden_spider/nmpc_ctrl_config.yaml`). 같은 모터를 쓰는 두 가지 철학입니다.
+
+### 마무리: 로봇과 공을 한 씬에
+
+#%% code
+scene = add_grid_floor(build_spider_scene())
+sph = mujoco.MjSpec.from_file(str(ASSET / "object" / "sphere.xml"))
+scene.attach(sph, prefix="ball/", frame=scene.worldbody.add_frame(pos=[0.9, 0.0, 0.6]))
+ball = scene.body("ball/sphere")
+ball.add_freejoint(name="ball/root")
+for g in ball.geoms:
+    if g.contype:
+        g.density = sphere_density(1.0, BALL_RADIUS)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    m_both = scene.compile()
+print("nq =", m_both.nq, "(로봇 37 + 공 7)")
+_, _, d_both = stand(m_both, kp=400.0, kd=20.0, seconds=2.0)
+media.show_image(render(m_both, d_both, make_camera(lookat=(0.3, 0, 0.3), distance=3.2, azimuth=140, elevation=-20), groups=[0, 1, 2]))
+
+#%% md
+## 섹터 0 을 마치며
+
+여기까지 만든 것:
+
+- MJCF 와 `MjSpec` 두 방식으로 모델을 쓰고, `MjModel` / `MjData` 에서 상태를 읽고 쓰는 법
+- 질량·충돌·마찰이 geom 에서 오고, default class 와 include 로 공유된다는 것
+- 관절 트리와 정기구학·야코비안, 액추에이터와 PD, 센서
+- 여러 파일을 한 씬으로 조립하는 법, 그리고 조립 과정에서 로봇 파일의 물리 설정이 덮어씌워진다는 것
+
+**스스로 답해 볼 질문** (`study/QUESTION_TREE.md` 의 Q0 가지)
+
+1. `robot.xml` 의 다리 collision geom 이 메시가 아니라 원기둥·상자인 이유는?
+2. Spider 의 geom 기본값이 `condim="4"` 인 이유는? `condim="3"` 으로 바꾸면 벽에 붙은 로봇에 무슨 일이 생길까?
+3. World 는 왜 `robot.xml` 의 `<motor>` 를 지우고 position 액추에이터를 넣을까? Core 시뮬레이터는 왜 그대로 둘까?
+4. `armature` 를 0 으로 만들면 시뮬레이션에 무슨 일이 생길까? 실제 로봇과 무엇이 달라질까?
+5. 같은 `robot.xml` 을 쓰는데도 World 와 Core 의 시뮬레이션 결과가 다를 수 있는 이유를 세 가지 이상 들어 보면?
+
+**부숴 보기**
+
+1. `build_spider_scene` 에서 `scene.compiler.degree = False` 를 지우면? (에러가 나는지, 조용히 틀리는지)
+2. `stand` 에서 `place_on_floor` 를 빼면 로봇은 어디서 시작하나? 그래도 서는가?
+3. 마지막 씬에서 공을 로봇 바로 위(`pos=[0, 0, 1.5]`)에서 떨어뜨리면 로봇은 버티는가? 공 질량을 20 kg 으로 올리면?
+
+다음은 **섹터 1 — 공 굴리기 환경** 입니다. Part 8 의 씬을 GPU 에 4096 개 올리고, World 와 같은 구조(매니저 기반 MDP)의 환경과 PPO 를 직접 만들어 공이 목적지에 가서 멈추도록 학습시킵니다.

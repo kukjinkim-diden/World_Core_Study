@@ -1,0 +1,5 @@
+# 빌드 산출물
+*/quiz
+.verify/
+07_onnx_bonus/build/
+07_onnx_bonus/build.log

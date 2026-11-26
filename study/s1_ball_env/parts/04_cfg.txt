@@ -1,0 +1,144 @@
+#%% md
+## Part 4 — 설정과 term: 매니저 방식의 뼈대
+
+World 에서 환경 하나를 정의한다는 것은 **설정 클래스 하나를 쓰는 것** 입니다. 관측 항, 보상 항, 종료 조건을 각각 "함수 + 인자" 로 적어 두면 매니저가 그것을 읽어 매 스텝 호출합니다. Spider 보행의 MDP 정의 전체가 `diden_configs/robots/diden_spider/magnet_locomotion_mdp.py` 한 파일에 이런 모양으로 들어 있습니다.
+
+```python
+@configclass
+class RewardsCfg:
+    tracking_lin_vel = RewTerm(func=mdp.track_lin_vel_xy_exp, weight=100.0, params={"std": 0.5})
+    foot_slip        = RewTerm(func=mdp.foot_slip, weight=800.0, operation=Operation.multiply, transformation=small_exp)
+    ...
+```
+
+이 방식의 장점은 "무엇을 계산하는가"(MDP 함수)와 "언제·어떻게 모으는가"(매니저)가 분리된다는 것입니다. 보상 항을 하나 추가하는 일이 설정 한 줄이 됩니다.
+
+용어:
+
+- **term**: 관측 항 하나, 보상 항 하나 같은 최소 단위. 설정은 `...TermCfg`.
+- **func**: term 을 계산하는 함수. 첫 인자는 항상 `env` 이고, `(N, ...)` 텐서를 돌려줍니다.
+- **params**: func 에 넘길 나머지 인자.
+- **manager**: 같은 종류의 term 들을 순서대로 불러 결과를 합치는 객체.
+
+### `configclass`
+
+World 의 설정 클래스는 `@configclass` 로 꾸며져 있습니다(`diden_common/configclass.py`). 파이썬 `dataclass` 에 두 가지를 더한 것입니다. (1) 타입 표기 없이 `name = 값` 으로만 써도 필드가 되고, (2) 기본값이 객체여도 인스턴스마다 따로 복사됩니다. 아래는 그 축소판이고 주어진 코드입니다.
+
+#%% code
+import copy
+import dataclasses
+import inspect
+
+
+def configclass(cls):
+    """dataclass + (타입 표기 없는 속성도 필드로) + (객체 기본값은 인스턴스마다 깊은 복사)."""
+    ann = dict(cls.__dict__.get("__annotations__", {}))
+    for name, value in list(cls.__dict__.items()):
+        if name.startswith("_") or name in ann:
+            continue
+        if inspect.isfunction(value) or isinstance(value, (type, property, classmethod, staticmethod)):
+            continue
+        ann[name] = type(value)
+    cls.__annotations__ = ann
+    for name in ann:
+        if name in cls.__dict__:
+            value = cls.__dict__[name]
+            if isinstance(value, dataclasses.Field):
+                continue
+            if not isinstance(value, (int, float, str, bool, tuple, type(None))) and not callable(value):
+                setattr(cls, name, field(default_factory=lambda v=value: copy.deepcopy(v)))
+    return dataclass(cls)
+
+
+@configclass
+class ManagerTermBaseCfg:
+    """모든 term 설정의 부모. (World: diden_common/manager_term_cfg.py)"""
+    func: Callable = None
+    params: dict = field(default_factory=dict)
+
+
+class ManagerTermBase:
+    """상태를 가져야 하는 term 은 함수 대신 이 클래스를 상속해 만든다. (World: manager_term_base.py)"""
+
+    def __init__(self, cfg, env):
+        self.cfg, self._env = cfg, env
+
+    @property
+    def num_envs(self) -> int:
+        return self._env.num_envs
+
+    @property
+    def device(self) -> str:
+        return self._env.device
+
+    def reset(self, env_ids=None) -> None:
+        pass
+
+    def __call__(self, *args, **kwargs):
+        raise NotImplementedError
+
+#%% md
+### 문제 4-1. 설정에서 term 꺼내기
+
+매니저는 생성될 때 설정 객체의 필드를 **정의된 순서대로** 훑어 term 을 모읍니다(World: 각 매니저의 `_prepare_terms`). 순서가 중요한 이유는 관측 벡터의 칸 배치가 이 순서로 정해지기 때문입니다. 학습 때와 배포 때 순서가 다르면 정책은 엉뚱한 값을 읽습니다.
+
+`iter_terms(cfg)` 는 `(이름, term 설정)` 목록을 돌려줍니다.
+
+- `dataclasses.fields(cfg)` 가 필드를 정의 순서대로 줍니다.
+- 값이 `None` 인 필드는 건너뜁니다(World 에서 term 을 끄는 방법이 `term = None` 입니다).
+- `ManagerTermBaseCfg` 의 인스턴스가 아닌 필드(예: 그룹 옵션 `enable_corruption`)도 건너뜁니다.
+
+### 문제 4-2. func 준비하기
+
+term 의 `func` 은 함수일 수도 있고 `ManagerTermBase` 를 상속한 **클래스** 일 수도 있습니다. 클래스면 `func(cfg=term_cfg, env=env)` 로 인스턴스를 만들어 그것을 호출 가능한 객체로 씁니다(World: `ManagerBase._resolve_common_term_cfg`). `resolve_term_func` 은 어느 쪽이든 "부를 수 있는 것" 을 돌려줍니다.
+
+#%% ex
+def iter_terms(cfg) -> list[tuple[str, Any]]:
+    """설정 객체에서 (이름, term 설정) 을 정의 순서대로 뽑는다."""
+    #>> fields(cfg) 를 돌며 getattr. None 과 term 설정이 아닌 것은 건너뛴다
+    out = []
+    for f in fields(cfg):
+        value = getattr(cfg, f.name)
+        if value is None or not isinstance(value, ManagerTermBaseCfg):
+            continue
+        out.append((f.name, value))
+    return out
+    #<<
+
+
+def resolve_term_func(term_cfg, env) -> Callable:
+    """term_cfg.func 이 클래스면 인스턴스를 만들어 돌려주고, 함수면 그대로 돌려준다."""
+    #>> inspect.isclass 로 구분
+    if inspect.isclass(term_cfg.func):
+        return term_cfg.func(cfg=term_cfg, env=env)
+    return term_cfg.func
+    #<<
+
+#%% test
+def _f1(env): return 1
+def _f2(env, k): return k
+
+class _Counter(ManagerTermBase):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.n = 0
+    def __call__(self, env):
+        self.n += 1
+        return self.n
+
+@configclass
+class _DemoCfg:
+    some_option: bool = True
+    b_term = ManagerTermBaseCfg(func=_f2, params={"k": 7})
+    a_term = ManagerTermBaseCfg(func=_f1)
+    off_term: ManagerTermBaseCfg = None
+    c_term = ManagerTermBaseCfg(func=_Counter)
+
+_cfg = _DemoCfg()
+_terms = iter_terms(_cfg)
+check("정의 순서 유지 (이름순이 아님), None 과 옵션은 제외", [n for n, _ in _terms] == ["b_term", "a_term", "c_term"])
+check("인스턴스마다 설정이 따로 (깊은 복사)", _DemoCfg().b_term is not _cfg.b_term)
+_fn = resolve_term_func(_terms[0][1], env=None)
+check("함수 term", _fn(None, **_terms[0][1].params) == 7)
+_cls_fn = resolve_term_func(_terms[2][1], env=None)
+check("클래스 term 은 인스턴스가 되어 상태를 가진다", isinstance(_cls_fn, _Counter) and _cls_fn(None) == 1 and _cls_fn(None) == 2)

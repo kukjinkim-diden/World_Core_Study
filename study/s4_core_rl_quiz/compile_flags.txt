@@ -1,0 +1,10 @@
+-std=c++20
+-Icommon
+-Wall
+-Wextra
+-DTEST_Q1
+-DTEST_Q2
+-DTEST_Q3
+-DTEST_Q4
+-DTEST_Q5
+-DTEST_Q6

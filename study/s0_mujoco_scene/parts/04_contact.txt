@@ -1,0 +1,272 @@
+#%% md
+## Part 4 — 접촉: 누가 누구와 부딪히는가, 마찰, 접촉력
+
+### 충돌 필터: `contype` 과 `conaffinity`
+
+두 geom A, B 는 다음 조건일 때만 충돌 검사를 합니다.
+
+```
+(A.contype & B.conaffinity) != 0   또는   (B.contype & A.conaffinity) != 0
+```
+
+`&` 는 비트 AND 입니다. `contype` 은 "나는 이런 종류다", `conaffinity` 는 "나는 이런 종류와 부딪힌다" 라고 읽으면 됩니다. 여기에 더해 MuJoCo 는 다음 쌍을 항상 제외합니다.
+
+- 같은 body 에 붙은 geom 끼리
+- 부모-자식 body 사이 (기본 설정)
+- 둘 다 세계에 고정된 geom 끼리
+
+### 문제 4-1. 충돌 필터 규칙
+
+#%% ex
+def can_collide(contype_a: int, conaffinity_a: int, contype_b: int, conaffinity_b: int) -> bool:
+    """비트마스크 규칙만으로 두 geom 이 충돌 후보인지 판정한다."""
+    #>> 위 규칙 그대로
+    return bool((contype_a & conaffinity_b) or (contype_b & conaffinity_a))
+    #<<
+
+#%% test
+check("기본값 (1,1) 끼리는 충돌", can_collide(1, 1, 1, 1))
+check("visual (0,0) 은 아무것과도 안 함", not can_collide(0, 0, 1, 1))
+check("object(1,0) 끼리는 안 함", not can_collide(1, 0, 1, 0))
+check("object(1,0) 와 바닥(1,1) 은 충돌", can_collide(1, 0, 1, 1))
+check("한쪽만 맞아도 충돌 (0,3) vs (2,0)", can_collide(0, 3, 2, 0))
+check("비트가 안 겹치면 안 함 (2,2) vs (1,1)", not can_collide(2, 2, 1, 1))
+
+#%% md
+### 먼저 예상해 보기
+
+`DIDEN_Asset/object/` 의 오브젝트는 전부 `contype=1, conaffinity=0` 입니다. Spider 로봇의 geom 기본값은 `contype=1, conaffinity=1` 입니다(`robot.xml` 의 `<default>`).
+
+1. 오브젝트 위에 다른 오브젝트를 떨어뜨리면 어떻게 될까요?
+2. 오브젝트 위에 로봇이 올라설 수 있을까요?
+3. 왜 이렇게 설계했을까요?
+
+아래는 Asset 의 `box.xml` 위로 Asset 의 `sphere.xml` 을 떨어뜨리는 실험입니다. `MjSpec` 으로 파일 두 개를 한 씬에 붙이는 방법은 Part 8 에서 직접 만듭니다. 지금은 결과만 봅니다.
+
+#%% code
+def _two_objects_scene(ball_conaffinity: int):
+    spec = mujoco.MjSpec()
+    spec.worldbody.add_light(pos=[0, 0, 4])
+    spec.worldbody.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[5, 5, 0.1])
+    box = mujoco.MjSpec.from_file(str(ASSET / "object" / "box.xml"))
+    spec.worldbody.add_frame().attach_body(box.body("box"), "box/", "")
+    sph = mujoco.MjSpec.from_file(str(ASSET / "object" / "sphere.xml"))
+    ball = spec.worldbody.add_frame(pos=[0.3, 0.2, 1.0]).attach_body(sph.body("sphere"), "ball/", "")
+    ball.add_freejoint(name="ball_free")
+    for g in ball.geoms:
+        if g.contype:                      # collision geom 만
+            g.conaffinity = ball_conaffinity
+            g.density = sphere_density(1.0, 0.2)
+    return spec.compile()
+
+for _ca in (0, 1):
+    m = _two_objects_scene(ball_conaffinity=_ca)
+    d = mujoco.MjData(m)
+    for _ in range(1500):
+        mujoco.mj_step(m, d)
+    print(f"공의 conaffinity={_ca}:  3초 뒤 공 높이 = {d.body('ball/sphere').xpos[2]:.3f} m   (상자 윗면 0.3 + 반지름 0.2 = 0.5, 바닥 + 반지름 = 0.2)")
+
+#%% md
+`conaffinity=0` 이면 공이 상자를 **통과** 해서 바닥에 놓입니다. 오브젝트끼리는 서로 검사하지 않고, `conaffinity` 에 1번 비트가 있는 geom(로봇)만 오브젝트와 부딪힙니다. 고정된 구조물끼리는 어차피 MuJoCo 가 검사하지 않으므로, 이 설정이 차이를 만드는 것은 지금처럼 오브젝트를 움직이는 물체로 쓸 때입니다. 3번 질문(왜 이렇게 정했는가)은 코드만으로는 답이 나오지 않습니다. Asset 담당자에게 물어볼 질문으로 `QUESTION_TREE.md` 에 적어 둡니다. 섹터 1 의 공은 바닥 위를 굴러야 하므로 바닥의 `conaffinity` 가 1 이면 충분합니다.
+
+### 접촉력 읽기
+
+스텝을 밟으면 `d.contact[:d.ncon]` 에 현재 접촉점들이 들어 있습니다. 각 접촉은 `geom1`, `geom2`(geom id), `pos`, `frame`(접촉 좌표계, 첫 축이 법선), `dist`(음수면 파고든 깊이)를 가집니다. 힘은 `mj_contactForce(m, d, i, out6)` 로 꺼내며, `out6[0]` 이 법선 방향 힘, `out6[1:3]` 이 접선(마찰) 힘입니다.
+
+World 에서 "발이 땅에 닿았는가" 를 판단하는 접촉 센서, 보상의 접촉력 항이 전부 여기서 나옵니다(`diden_common/sim_adapter.py` 의 `get_contact_info`).
+
+### 문제 4-2. 접촉 목록 만들기
+
+#%% ex
+def contact_list(m, d):
+    """현재 접촉을 [(geom1 이름, geom2 이름, 법선력[N]), ...] 로 돌려준다."""
+    out = []
+    #>> d.ncon 개의 접촉을 돌며 mj_contactForce 로 힘을 읽는다
+    f6 = np.zeros(6)
+    for i in range(d.ncon):
+        c = d.contact[i]
+        mujoco.mj_contactForce(m, d, i, f6)
+        out.append((m.geom(c.geom1).name, m.geom(c.geom2).name, float(f6[0])))
+    #<<
+    return out
+
+#%% test
+m = mujoco.MjModel.from_xml_string(ball_with_classes_xml(mass=1.0, radius=0.2))
+d = mujoco.MjData(m)
+for _ in range(1000):
+    mujoco.mj_step(m, d)
+_c = contact_list(m, d)
+print("  ", _c)
+check("접촉 1개: floor 와 ball_collision", len(_c) == 1 and set(_c[0][:2]) == {"floor", "ball_collision"})
+check_close("정지한 1 kg 공의 법선력 = m·g", _c[0][2], 9.81, atol=1e-3)
+
+#%% md
+### 마찰
+
+geom 의 `friction="a b c"` 는 세 개의 계수입니다.
+
+| 칸 | 이름 | 막는 운동 | 쓰이려면 |
+|---|---|---|---|
+| 1 | sliding | 접선 방향 미끄러짐 | `condim >= 3` (기본) |
+| 2 | torsional | 법선축 둘레 비틀림 | `condim >= 4` |
+| 3 | rolling | 구름 | `condim = 6` |
+
+두 geom 이 만났을 때 쓰는 계수는 **둘 중 큰 값** 입니다(평균이 아닙니다). 단 `priority` 가 높은 geom 이 있으면 그쪽 값만 씁니다. World 의 Spider 설정은 로봇의 collision geom 에 `priority=1` 을 줍니다(`diden_mjlab/robots/diden_spider/cfg.py` 의 `CUSTOM_COLLISION`). 그러면 지형의 마찰값이 무엇이든 로봇 쪽 값이 쓰이고, 마찰 랜덤화도 로봇 쪽 값 하나만 바꾸면 됩니다.
+
+Spider 의 `robot.xml` 은 `condim="4"` 로 torsional 마찰까지 켭니다. 발 하나로 붙어 있을 때 그 발이 법선축 둘레로 돌아가는 것을 막는 항입니다.
+
+### 경사면 실험
+
+바닥을 기울이는 대신 **중력을 기울입니다**. 경사각 $\theta$ 는 `m.opt.gravity = g·(sinθ, 0, -cosθ)` 와 같습니다.
+
+#%% code
+def tilt_gravity(m, theta_rad: float, g: float = 9.81):
+    """x 방향으로 theta 만큼 기운 경사면 위에 있는 것과 같게 중력을 돌린다."""
+    m.opt.gravity[:] = g * np.array([np.sin(theta_rad), 0.0, -np.cos(theta_rad)])
+
+
+def box_on_floor_xml(mu_box: float, mu_floor: float) -> str:
+    return f"""
+<mujoco><option timestep="0.002"/><worldbody>
+  <light pos="0 0 3"/>
+  <geom name="floor" type="plane" size="50 5 0.1" friction="{mu_floor}"/>
+  <body name="box" pos="0 0 0.05"><freejoint name="box_free"/>
+    <geom name="box" type="box" size="0.05 0.05 0.05" friction="{mu_box}"/></body>
+</worldbody></mujoco>"""
+
+#%% md
+### 문제 4-3. 미끄러질까?
+
+경사각과 두 geom 의 마찰계수를 받아, 상자가 1초 동안 미끄러지는 거리를 **해석적으로** 예측합니다. 미끄러지지 않으면 0 을 돌려줍니다.
+
+<details><summary>힌트</summary>
+
+미끄러지는 조건은 $\tan\theta > \mu$, 미끄러질 때 가속도는 $a = g(\sin\theta - \mu\cos\theta)$, 거리는 $\tfrac12 a t^2$ 입니다. $\mu$ 는 두 계수 중 **큰 값**.
+</details>
+
+#%% ex
+def predict_box_slide(theta_rad: float, mu_box: float, mu_floor: float, t: float = 1.0, g: float = 9.81) -> float:
+    #>> 유효 마찰계수 → 미끄럼 조건 → 거리
+    mu = max(mu_box, mu_floor)
+    if np.tan(theta_rad) <= mu:
+        return 0.0
+    return 0.5 * g * (np.sin(theta_rad) - mu * np.cos(theta_rad)) * t**2
+    #<<
+
+#%% test
+for _mu_b, _mu_f, _deg in [(0.5, 0.2, 20), (0.5, 0.2, 30), (0.2, 0.5, 40), (0.3, 0.3, 15), (0.3, 0.3, 25)]:
+    m = mujoco.MjModel.from_xml_string(box_on_floor_xml(_mu_b, _mu_f))
+    d = mujoco.MjData(m)
+    tilt_gravity(m, np.radians(_deg))
+    for _ in range(500):
+        mujoco.mj_step(m, d)
+    _pred = predict_box_slide(np.radians(_deg), _mu_b, _mu_f)
+    check_close(f"μ_box={_mu_b} μ_floor={_mu_f} θ={_deg}°: sim {d.qpos[0]:.4f} m / 예측 {_pred:.4f} m", d.qpos[0], _pred, atol=0.01)
+
+#%% md
+"미끄러지지 않는다" 고 예측한 경우에도 시뮬레이션에서는 1~5 mm 움직입니다. 버그가 아니라 MuJoCo 의 접촉이 **부드러운 제약** 이기 때문입니다. 마찰 제약도 약간의 속도를 허용해서, 정지 마찰 상태에서도 아주 천천히 흐릅니다(creep). 벽에 붙어 있어야 하는 로봇에게는 이 흐름이 문제가 되므로 두 레포가 각자 대책을 씁니다.
+
+- Core / `robot.xml`: `noslip_iterations="20"` (접촉 풀이 뒤에 미끄럼만 다시 잡는 후처리)
+- World: `cone="elliptic"`, `impratio=10` (마찰 제약을 법선 제약보다 10배 단단하게) — `diden_configs/sim_profiles/mujoco_warp/diden_spider.py`
+
+### 구르기
+
+이제 공입니다. 경사각 $\theta$ 에서 반지름 $r$, 질량 $m$, 관성 $I = \tfrac25 m r^2$ 인 공이 **미끄러지지 않고** 구르면
+
+$$m a = m g\sin\theta - f, \qquad I\,\frac{a}{r} = f\,r \quad\Rightarrow\quad a = \frac{g\sin\theta}{1 + I/(m r^2)} = \tfrac57\, g\sin\theta$$
+
+이때 필요한 마찰력은 $f = \tfrac27 m g\sin\theta$ 이고, 이것이 $\mu m g\cos\theta$ 를 넘으면 미끄러지면서 구릅니다.
+
+### 문제 4-4. 구르는 공의 가속도
+
+#%% ex
+def predict_ball_accel(theta_rad: float, mu: float, g: float = 9.81) -> float:
+    """경사각 theta, 마찰계수 mu 일 때 균일한 구의 중심 가속도. 미끄러지는 경우까지 처리한다."""
+    #>> 굴림 조건 mu >= 2/7 tanθ 를 먼저 확인
+    if mu >= 2.0 / 7.0 * np.tan(theta_rad):
+        return 5.0 / 7.0 * g * np.sin(theta_rad)
+    return g * (np.sin(theta_rad) - mu * np.cos(theta_rad))
+    #<<
+
+#%% test
+def _ball_accel_sim(theta, mu):
+    m = mujoco.MjModel.from_xml_string(f"""
+<mujoco><option timestep="0.002"/><worldbody>
+  <geom name="floor" type="plane" size="50 5 0.1" friction="{mu}"/>
+  <body name="ball" pos="0 0 0.1"><freejoint/><geom type="sphere" size="0.1" friction="{mu}"/></body>
+</worldbody></mujoco>""")
+    d = mujoco.MjData(m)
+    tilt_gravity(m, theta)
+    for _ in range(100):
+        mujoco.mj_step(m, d)
+    v0 = d.qvel[0]
+    for _ in range(500):
+        mujoco.mj_step(m, d)
+    return (d.qvel[0] - v0) / (500 * m.opt.timestep), d.qvel[0] - d.qvel[4] * 0.1   # 가속도, 접촉점 미끄럼 속도
+
+for _mu, _deg in [(1.0, 10), (0.5, 30), (0.2, 30), (0.1, 30), (0.05, 20)]:
+    _a, _slip = _ball_accel_sim(np.radians(_deg), _mu)
+    _pred = predict_ball_accel(np.radians(_deg), _mu)
+    check_close(f"μ={_mu} θ={_deg}°: sim a={_a:.3f} / 예측 {_pred:.3f}  (접촉점 미끄럼 속도 {_slip:+.3f} m/s)", _a, _pred, rtol=0.01)
+
+#%% md
+### 토크로 공 굴리기 — 섹터 1 의 액션
+
+섹터 1 의 정책은 공에 **토크** 를 걸어 굴립니다. 바닥이 수평일 때 공에 y 축 토크 $\tau$ 를 걸면, 접촉점의 마찰력 $f$ 가 공을 +x 로 밉니다.
+
+$$m a = f, \qquad I\,\frac{a}{r} = \tau - f r \quad\Rightarrow\quad a = \frac{\tau}{r\,(m + I/r^2)} = \frac{\tau}{\tfrac75\, m r}$$
+
+필요한 마찰력 $f = m a$ 가 $\mu m g$ 를 넘으면 헛돕니다.
+
+`MjData` 에는 body 에 외력을 직접 거는 칸이 있습니다: `d.xfrc_applied[body_id] = [Fx, Fy, Fz, Tx, Ty, Tz]`. **세계 좌표계** 기준이고 body 의 질량중심에 작용합니다. 한 번 써넣으면 지울 때까지 유지됩니다.
+
+### 문제 4-5. 헛돌지 않는 최대 토크
+
+#%% ex
+def predict_ball_accel_from_torque(torque: float, mass: float, radius: float) -> float:
+    """미끄러지지 않을 때, y 축 토크가 만드는 x 방향 가속도."""
+    #>> a = τ / (7/5 · m · r)
+    return torque / (1.4 * mass * radius)
+    #<<
+
+
+def max_torque_without_slip(mu: float, mass: float, radius: float, g: float = 9.81) -> float:
+    """이 값을 넘으면 공이 헛돈다."""
+    #>> 필요한 마찰력 m·a = μ·m·g 가 되는 토크
+    return 1.4 * mu * mass * g * radius
+    #<<
+
+#%% test
+def _torque_roll(torque, mu=0.5, mass=1.0, radius=0.2, seconds=1.0):
+    m = mujoco.MjModel.from_xml_string(f"""
+<mujoco><option timestep="0.002"/><worldbody>
+  <geom name="floor" type="plane" size="50 50 0.1" friction="{mu}"/>
+  <body name="ball" pos="0 0 {radius}"><freejoint/>
+    <geom type="sphere" size="{radius}" friction="{mu}" density="{sphere_density(mass, radius)}"/></body>
+</worldbody></mujoco>""")
+    d = mujoco.MjData(m)
+    d.xfrc_applied[m.body("ball").id, 4] = torque          # 세계 y 축 토크
+    for _ in range(round(seconds / m.opt.timestep)):
+        mujoco.mj_step(m, d)
+    lin, ang = d.qvel[:3], quat_rotate(d.qpos[3:7], d.qvel[3:6])
+    return lin[0] / seconds, lin[0] - ang[1] * radius        # 평균 가속도, 접촉점 미끄럼 속도
+
+_tmax = max_torque_without_slip(0.5, 1.0, 0.2)
+check_close("τ_max (μ=0.5, 1 kg, r=0.2)", _tmax, 1.3734, atol=1e-4)
+_a, _slip = _torque_roll(0.5 * _tmax)
+check_close(f"τ = 0.5·τ_max: 가속도 {_a:.3f} m/s², 미끄럼 {_slip:+.4f} m/s", _a, predict_ball_accel_from_torque(0.5 * _tmax, 1.0, 0.2), rtol=0.01)
+check("   → 거의 미끄러지지 않음", abs(_slip) < 0.01)
+_a, _slip = _torque_roll(2.0 * _tmax)
+check_close(f"τ = 2·τ_max: 가속도 {_a:.3f} m/s² 는 μ·g 에서 포화, 미끄럼 {_slip:+.3f} m/s", _a, 0.5 * 9.81, rtol=0.01)
+check("   → 헛돈다", _slip < -1.0)
+
+#%% md
+**정리**
+
+- 충돌 여부는 `contype` / `conaffinity` 비트마스크로 정하고, 마찰계수는 두 geom 중 큰 값(또는 `priority` 높은 쪽)을 씁니다.
+- 공을 토크로 굴릴 때 낼 수 있는 가속도는 $\mu g$ 를 넘지 못합니다. 섹터 1 에서 **액션 스케일** (정책 출력 1 이 몇 N·m 인가)을 정할 때 이 한계가 기준이 됩니다. 한계보다 훨씬 큰 토크를 허용하면 정책은 헛도는 구간에서 시간을 보내고, 마찰을 랜덤화하면 한계 자체가 환경마다 달라집니다.
+
+**부숴 보기**
+
+1. `_torque_roll` 의 MJCF 에서 바닥 마찰만 0.1 로 낮추면 결과가 달라질까요? (힌트: 큰 값 규칙)
+2. `condim="6"` 과 rolling 마찰 `friction="0.5 0.005 0.01"` 을 주고 토크 없이 굴려 보면 공이 멈춥니다. 섹터 1 의 공은 `condim=3` 이라 한번 구르면 스스로 멈추지 않습니다. 정책이 **제동** 을 배워야 한다는 뜻입니다.

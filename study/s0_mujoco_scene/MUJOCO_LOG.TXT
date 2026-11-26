@@ -1,0 +1,50 @@
+WARNING Wed Nov 25 21:03:06 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:03:06 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:42:18 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:42:18 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:42:51 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:42:51 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:42:52 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:42:53 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:48:03 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+
+WARNING Wed Nov 25 21:48:03 2026: Attach conflict when attaching 'diden_spider_v2', policy is 'warning'
+timestep: parent has 0.001 (default), child has 0.0005, keeping parent value
+noslip_iterations: parent has 0 (default), child has 20, keeping parent value
+gravity: parent has 0 0 -9.81 (default), child has 0 0 -9.80665, keeping parent value
+

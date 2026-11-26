@@ -1,0 +1,163 @@
+#%% md
+## Part 10 — `EventManager`: 리셋과 도메인 랜덤화
+
+**이벤트** 는 "정책과 무관하게 환경에 일어나는 일" 입니다. 언제 일어나는가를 **mode** 로 나눕니다. World 의 mode(`diden_env/managers/event_manager.py`)는 다음과 같고, 필요하면 자기 mode 를 만들어 환경에서 직접 불러도 된다고 되어 있습니다.
+
+| mode | 언제 | Spider 에서의 예 |
+|---|---|---|
+| `startup` | 학습 시작 때 한 번 | (Spider 는 쓰지 않음) |
+| `reset` | 환경이 리셋될 때, 그 환경에만 | 초기 자세, PD 게인 ±10 %, 마찰 0.25~0.4, 링크 질량 ×0.8~1.5, 무게중심 이동, 로터 관성 |
+| `physics_step` | 물리 서브스텝마다 | 자석 상태기계, 관절 stick-slip 마찰 |
+
+**도메인 랜덤화(DR)** 는 시뮬레이터의 물리 파라미터를 환경마다, 에피소드마다 다르게 뽑는 것입니다. 실제 로봇의 마찰, 질량, 모터 특성을 정확히 알 수 없으므로 "이 범위 어딘가에 있을 것" 이라고 보고 그 범위 전체에서 동작하는 정책을 학습시킵니다. 범위가 좁으면 실제 로봇에서 실패하고, 넓으면 학습이 어려워지고 정책이 조심스러워집니다.
+
+이벤트 함수의 서명은 `func(env, env_ids, **params)` 입니다. 관측·보상 함수와 달리 `env_ids` 를 받고 아무것도 돌려주지 않습니다.
+
+우리 이벤트:
+
+| 항 | mode | 하는 일 |
+|---|---|---|
+| `randomize_friction` | `reset` | 공의 마찰계수를 0.3~1.0 에서 새로 뽑는다 |
+| `reset_ball` | `reset` | 공을 ±2 m 안 임의 위치에, ±0.5 m/s 의 임의 속도로 놓는다 |
+| `push_ball` | `interval` (우리가 만드는 mode) | 3~5 초마다 공을 ±1 m/s 로 걷어찬다 |
+
+`interval` 은 World 의 `EventManager` 에는 없는 mode 입니다. World 에는 `push_robot` 함수가 있지만(`diden_env/mdp/events/reset.py`) Spider 설정에 연결되어 있지 않습니다. 여기서는 "외란을 견디는 정책" 을 보기 위해 넣습니다.
+
+### 문제 10-1. 이벤트 함수
+
+`reset_ball_uniform` 에서 공을 굴러가는 중인 상태로 놓으려면 선속도 $v$ 에 맞는 각속도도 줘야 합니다. 미끄러지지 않고 구르는 공은 $\omega = \hat z \times v / r$, 즉 $(\omega_x, \omega_y) = (-v_y, v_x) / r$ 입니다. 각속도를 0 으로 두면 리셋 직후 공이 바닥에서 미끄러지다가 구르기 시작해, 정책이 보는 첫 몇 스텝이 이상해집니다.
+
+#%% ex
+def randomize_ball_friction(env, env_ids: torch.Tensor, friction_range: tuple) -> None:
+    #>> 범위에서 뽑아 sim_adapter.write_geom_friction
+    friction = sample_uniform(*friction_range, (len(env_ids),), env.device)
+    env.sim_adapter.write_geom_friction(env_ids, friction)
+    #<<
+
+
+def reset_ball_uniform(env, env_ids: torch.Tensor, pos_range: tuple, lin_vel_range: tuple) -> None:
+    """공을 임의 위치·속도로 놓는다. 높이는 반지름, 자세는 단위 쿼터니언, 각속도는 구름 조건에 맞춘다."""
+    n, dev, r = len(env_ids), env.device, env.sim_adapter.radius
+    #>> pos (n,3), quat (n,4), lin_vel (n,3), ang_vel (n,3) 를 만들어 write_root_state
+    pos = torch.zeros(n, 3, device=dev)
+    pos[:, :2] = sample_uniform(*pos_range, (n, 2), dev)
+    pos[:, 2] = r
+    quat = torch.zeros(n, 4, device=dev)
+    quat[:, 0] = 1.0
+    lin_vel = torch.zeros(n, 3, device=dev)
+    lin_vel[:, :2] = sample_uniform(*lin_vel_range, (n, 2), dev)
+    ang_vel = torch.stack([-lin_vel[:, 1], lin_vel[:, 0], torch.zeros(n, device=dev)], dim=-1) / r
+    env.sim_adapter.write_root_state(env_ids, pos, quat, lin_vel, ang_vel)
+    #<<
+
+
+def push_ball(env, env_ids: torch.Tensor, velocity_range: tuple) -> None:
+    """공의 선속도 xy 에 임의의 값을 더한다 (걷어차기)."""
+    #>> 현재 상태를 읽어 선속도만 바꿔 다시 쓴다
+    ad = env.sim_adapter
+    lin_vel = ad.root_lin_vel_w[env_ids].clone()
+    lin_vel[:, :2] += sample_uniform(*velocity_range, (len(env_ids), 2), env.device)
+    ad.write_root_state(env_ids, ad.root_pos_w[env_ids].clone(), ad.root_quat_w[env_ids].clone(), lin_vel, ad.root_ang_vel_w[env_ids])
+    #<<
+
+#%% md
+### 문제 10-2. `EventManager`
+
+- `apply(mode, env_ids=None, dt=None)`
+  - `startup`, `reset` 등: 그 mode 의 항을 순서대로 `func(env, env_ids, **params)`. `env_ids` 가 `None` 이면 전체 환경.
+  - `interval`: 항마다 환경별 남은 시간 `self._interval_time_left[name]` 이 있다. `dt` 만큼 줄이고, 0 이하가 된 환경에만 함수를 부른 뒤, 그 환경의 남은 시간을 `interval_range_s` 에서 다시 뽑는다.
+- `reset(env_ids)`: 리셋된 환경의 interval 타이머를 다시 뽑는다.
+
+#%% ex
+@configclass
+class EventTermCfg(ManagerTermBaseCfg):
+    mode: str = "reset"
+    interval_range_s: tuple = None            # mode="interval" 일 때만
+
+
+class EventManager:
+    """(World: diden_env/managers/event_manager.py)"""
+
+    def __init__(self, cfg, env):
+        self._env = env
+        self._mode_terms: dict[str, list[tuple[str, EventTermCfg, Callable]]] = {}
+        self._interval_time_left: dict[str, torch.Tensor] = {}
+        for name, tc in iter_terms(cfg):
+            self._mode_terms.setdefault(tc.mode, []).append((name, tc, resolve_term_func(tc, env)))
+            if tc.mode == "interval":
+                self._interval_time_left[name] = sample_uniform(*tc.interval_range_s, (env.num_envs,), env.device)
+
+    @property
+    def available_modes(self) -> list[str]:
+        return list(self._mode_terms)
+
+    def apply(self, mode: str, env_ids: torch.Tensor = None, dt: float = None) -> None:
+        if mode not in self._mode_terms:
+            return
+        for name, term_cfg, fn in self._mode_terms[mode]:
+            #>> interval 이면 타이머 처리, 아니면 그대로 호출
+            if mode == "interval":
+                time_left = self._interval_time_left[name]
+                time_left -= dt
+                ids = (time_left <= 0.0).nonzero(as_tuple=False).squeeze(-1)
+                if len(ids) > 0:
+                    fn(self._env, ids, **term_cfg.params)
+                    time_left[ids] = sample_uniform(*term_cfg.interval_range_s, (len(ids),), self._env.device)
+            else:
+                ids = env_ids if env_ids is not None else torch.arange(self._env.num_envs, device=self._env.device)
+                fn(self._env, ids, **term_cfg.params)
+            #<<
+
+    def reset(self, env_ids: torch.Tensor) -> dict:
+        #>> 리셋된 환경의 interval 타이머를 다시 뽑는다
+        for name, term_cfg, _ in self._mode_terms.get("interval", []):
+            self._interval_time_left[name][env_ids] = sample_uniform(*term_cfg.interval_range_s, (len(env_ids),), self._env.device)
+        #<<
+        return {}
+
+#%% test
+@configclass
+class EventsCfg:
+    randomize_friction = EventTermCfg(func=randomize_ball_friction, mode="reset", params={"friction_range": (0.3, 1.0)})
+    reset_ball = EventTermCfg(func=reset_ball_uniform, mode="reset", params={"pos_range": (-2.0, 2.0), "lin_vel_range": (-0.5, 0.5)})
+    push_ball = EventTermCfg(func=push_ball, mode="interval", interval_range_s=(3.0, 5.0), params={"velocity_range": (-1.0, 1.0)})
+
+torch.manual_seed(0)
+fake = _FakeEnv(num_envs=4096)
+_all = torch.arange(4096, device=DEVICE)
+fake.event_manager = EventManager(EventsCfg(), fake)
+check("mode 목록", set(fake.event_manager.available_modes) == {"reset", "interval"})
+_ad = fake.sim_adapter
+_some = torch.arange(0, 4096, 2, device=DEVICE)                 # 짝수 환경만 리셋
+fake.event_manager.apply("reset", env_ids=_some)
+fake.sim.forward()
+check("리셋된 환경: 위치 ±2, 높이 = 반지름", _ad.root_pos_w[_some, :2].abs().max() <= 2.0 and (_ad.root_pos_w[_some, 2] == BALL_RADIUS).all())
+check("리셋 안 된 환경은 원점 그대로", _ad.root_pos_w[1::2, :2].abs().max() == 0)
+check("마찰이 0.3~1.0 로 랜덤화 (리셋된 환경만)", _ad.geom_friction[_some].min() >= 0.3 and _ad.geom_friction[_some].max() < 1.0
+      and _ad.geom_friction[_some].std() > 0.15 and (_ad.geom_friction[1::2] == 1.0).all())
+_v, _w = _ad.root_lin_vel_w[_some], _ad.root_ang_vel_w[_some]
+check_close("구름 조건: 접촉점 속도 v + ω × (−r ẑ) = 0", _v[:, :2] - torch.stack([_w[:, 1], -_w[:, 0]], dim=-1) * BALL_RADIUS, torch.zeros(2048, 2), atol=1e-5)
+_pos0 = _ad.root_pos_w[_some].clone()
+for _ in range(20):
+    fake.sim.step()
+_slip = (_ad.root_lin_vel_w[_some, 0] - _ad.root_ang_vel_w[_some, 1] * BALL_RADIUS).abs().max().item()
+check(f"그래서 리셋 직후에도 미끄러지지 않고 구른다 (접촉점 미끄럼 {_slip:.4f} m/s)", _slip < 0.02)
+
+# interval: 3~5 초마다 걷어차기
+fake.event_manager.apply("reset", env_ids=_all)
+_v0 = _ad.root_lin_vel_w.clone()
+for _ in range(149):                                             # 2.98 초
+    fake.event_manager.apply("interval", dt=0.02)
+check("3초 전에는 아무도 차이지 않음", (_ad.root_lin_vel_w == _v0).all())
+for _ in range(60):                                              # 4.18 초 시점
+    fake.event_manager.apply("interval", dt=0.02)
+_pushed = (_ad.root_lin_vel_w != _v0).any(dim=-1).float().mean().item()
+print(f"   4.18초 시점에 차인 환경 비율: {_pushed:.3f}  (기대값 (4.18−3)/2 = 0.59)")
+check("일부 환경만 차임", 0.5 < _pushed < 0.7)
+
+#%% md
+**실제 코드에서는**
+
+- 리셋 자세가 훨씬 복잡합니다. Spider 는 발 위치 ±0.15 m, 몸통 ±0.05 m, roll/pitch ±15°, yaw 전 범위를 뽑은 뒤 **역기구학** 으로 그 자세에 맞는 관절각을 풉니다(`diden_env/mdp/events/reset.py`). 벽에 붙은 채로 시작해야 하므로 아무 자세나 줄 수 없습니다.
+- **설정의 값이 나중에 덮어써지는 경우** 가 있습니다. Spider 설정 파일의 PD 게인 랜덤화 범위는 25~35 로 적혀 있지만 환경 설정에서 100/20 의 ±10 % 로 다시 써집니다. 액션 스케일도 0.4 로 적혀 있고 0.2 로 덮어써집니다. 설정을 읽을 때는 "마지막에 누가 쓰는가" 까지 따라가야 합니다.
+- 모델 값을 환경마다 다르게 주려면 그 필드를 미리 늘려 둬야 합니다(Part 3). World 는 랜덤화할 필드 목록을 환경 생성 때 한꺼번에 늘립니다. 목록에 없는 필드를 랜덤화하려 하면 모든 환경이 같은 값을 공유하게 됩니다.

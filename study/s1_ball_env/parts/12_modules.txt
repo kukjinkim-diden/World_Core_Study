@@ -1,0 +1,190 @@
+#%% md
+## Part 12 — 네트워크: `RunningNormalization` 과 `ActorCritic`
+
+환경이 끝났으니 학습 알고리즘입니다. World 의 PPO 는 `diden-rl` 패키지에 있습니다. 문서는 이 패키지를 "frozen RL island" 라고 부르는데, 다른 패키지와 달리 거의 고치지 않고 통째로 가져다 쓰는 부분이라는 뜻입니다. 구조는 `rsl_rl` 계열과 같습니다.
+
+```
+OnPolicyRunner.learn()
+  반복:
+    1. 수집   obs → PPO.act() → env.step() → PPO.process_env_step()      × num_steps_per_env
+    2. 반환값 PPO.compute_returns()   (RolloutStorage 가 GAE 계산)
+    3. 갱신   PPO.update()            (미니배치로 여러 epoch)
+```
+
+### 관측 정규화
+
+관측 항마다 크기가 다릅니다. 각속도는 ±10 rad/s 까지 가고 마찰계수는 0.3~1.0 입니다. 신경망은 입력 크기가 비슷할 때 잘 배우므로, 입구에서 항마다 평균을 빼고 표준편차로 나눕니다. 평균과 분산은 미리 알 수 없으니 **들어오는 관측으로 계속 갱신** 합니다(`diden_rl/modules/utils.py` 의 `RunningNormalization`).
+
+지금까지 본 표본 수가 $n$, 평균 $\mu$, 분산 $\sigma^2$ 일 때 크기 $m$ 인 새 배치(평균 $\mu_b$, 분산 $\sigma_b^2$)를 합치면
+
+$$\delta = \mu_b - \mu,\quad N = n + m,\qquad \mu' = \mu + \delta\,\frac{m}{N},\qquad \sigma'^2 = \frac{\sigma^2 n + \sigma_b^2 m + \delta^2\, n m / N}{N}$$
+
+이 평균·분산은 정책의 일부입니다. 배포할 때 같이 가져가지 않으면 정책은 학습 때와 전혀 다른 크기의 입력을 받습니다. World 는 ONNX 를 만들 때 정규화를 그래프 안에 넣어 버립니다(Part 17). Core 가 관측에 아무 스케일도 곱하지 않는 이유입니다.
+
+### 문제 12-1. `RunningNormalization`
+
+`forward(x)` 는 **현재 통계로 정규화한 값** 을 돌려주고, 학습 모드(`self.training`)일 때만 그 뒤에 통계를 갱신합니다.
+
+#%% ex
+class RunningNormalization(nn.Module):
+    """(World: diden_rl/modules/utils.py)"""
+
+    def __init__(self, num_inputs: int, epsilon: float = 1e-8):
+        super().__init__()
+        self.register_buffer("running_mean", torch.zeros(num_inputs))
+        self.register_buffer("running_var", torch.ones(num_inputs))
+        self.register_buffer("count", torch.ones(1))
+        self.epsilon = epsilon
+
+    @torch.no_grad()
+    def update_stats(self, x: torch.Tensor) -> None:
+        #>> 위 식. x.var(0, unbiased=False) 를 쓴다
+        batch_mean, batch_var, batch_count = x.mean(0), x.var(0, unbiased=False), x.shape[0]
+        delta = batch_mean - self.running_mean
+        total = self.count + batch_count
+        new_mean = self.running_mean + delta * batch_count / total
+        new_var = (self.running_var * self.count + batch_var * batch_count
+                   + delta.pow(2) * self.count * batch_count / total) / total
+        self.running_mean.copy_(new_mean)
+        self.running_var.copy_(new_var)
+        self.count.copy_(total)
+        #<<
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        #>> (x − mean) / sqrt(var + eps), 그리고 학습 모드면 update_stats
+        normalized = (x - self.running_mean) / torch.sqrt(self.running_var + self.epsilon)
+        if self.training:
+            self.update_stats(x)
+        return normalized
+        #<<
+
+#%% test
+torch.manual_seed(0)
+_norm = RunningNormalization(3).to(DEVICE)
+_data = torch.randn(50000, 3, device=DEVICE) * torch.tensor([0.1, 1.0, 10.0], device=DEVICE) + torch.tensor([5.0, 0.0, -3.0], device=DEVICE)
+_first = _norm(_data[:1000])
+check_close("첫 호출은 초기 통계(평균 0, 분산 1)로 정규화 → 입력 그대로", _first, _data[:1000], atol=1e-5)
+for _i in range(1000, 50000, 1000):
+    _norm(_data[_i:_i + 1000])
+check_close("평균 수렴", _norm.running_mean, [5.0, 0.0, -3.0], atol=0.1)
+check_close("표준편차 수렴", _norm.running_var.sqrt(), [0.1, 1.0, 10.0], rtol=0.03)
+_out = _norm(_data)
+check_close("정규화 결과는 평균 0, 표준편차 1", [_out.mean().item(), _out.std().item()], [0.0, 1.0], atol=0.03)
+_norm.eval()
+_c = _norm.count.clone()
+_norm(_data)
+check("eval 모드에서는 통계가 갱신되지 않음", torch.equal(_norm.count, _c))
+
+#%% md
+### 정책은 분포를 낸다
+
+PPO 의 정책은 액션 하나를 내지 않고 **가우시안 분포** 를 냅니다. 평균 $\mu(o)$ 는 신경망이 내고, 표준편차 $\sigma$ 는 관측과 무관한 학습 파라미터입니다. 학습 중에는 이 분포에서 뽑아(탐색) 쓰고, 배포할 때는 평균만 씁니다.
+
+$$a \sim \mathcal N(\mu_\theta(o),\ \sigma^2), \qquad \log \pi(a \mid o) = \sum_i \Big[-\frac{(a_i - \mu_i)^2}{2\sigma_i^2} - \log \sigma_i - \tfrac12 \log 2\pi\Big]$$
+
+가치 네트워크(critic)는 따로 있고, critic 관측을 받아 "지금부터 받을 할인 보상의 합" 을 숫자 하나로 냅니다.
+
+### 문제 12-2. `ActorCritic`
+
+- `actor`, `critic`: MLP. 은닉층 활성화는 ELU, 출력층에는 활성화가 없습니다. `create_mlp` 는 주어져 있습니다.
+- `self.std`: 크기 `num_actions` 의 `nn.Parameter`, 초기값 `init_noise_std`.
+- `update_distribution(actor_obs)`: 정규화 → actor → `torch.distributions.Normal(mean, std)` 를 `self.distribution` 에 저장. std 는 `min_std` 이상으로 자릅니다.
+- `act(actor_obs, deterministic=False)`: 분포를 갱신하고 표본(또는 평균)을 돌려준다.
+- `get_actions_log_prob(actions)`: 현재 분포에서의 로그 확률. 액션 차원에 대해 **합** 해서 `(N,)`.
+- `evaluate(critic_obs)`: 정규화 → critic → `(N, 1)`.
+- `action_mean`, `action_std`, `entropy`: 현재 분포의 것. `entropy` 는 차원에 대해 합.
+
+World 의 초기화(`actor_critic.py`)를 따라 가중치는 직교 초기화하고, actor 의 **마지막 층은 0.01 배** 로 줄입니다. 처음에 평균이 거의 0 이 되어 탐색이 `std` 로만 정해지게 하기 위해서입니다.
+
+#%% ex
+def create_mlp(input_dim: int, hidden_dims, output_dim: int) -> nn.Sequential:
+    """(주어진 코드) ELU MLP."""
+    layers, d = [], input_dim
+    for h in hidden_dims:
+        layers += [nn.Linear(d, h), nn.ELU()]
+        d = h
+    layers.append(nn.Linear(d, output_dim))
+    return nn.Sequential(*layers)
+
+
+def orthogonal_init(module: nn.Module, last_layer_scale: float) -> None:
+    """(주어진 코드) 직교 초기화. 마지막 Linear 만 last_layer_scale 배."""
+    linears = [m for m in module.modules() if isinstance(m, nn.Linear)]
+    for i, m in enumerate(linears):
+        nn.init.orthogonal_(m.weight, gain=last_layer_scale if i == len(linears) - 1 else math.sqrt(2))
+        nn.init.zeros_(m.bias)
+
+
+class ActorCritic(nn.Module):
+    """(World: diden_rl/modules/actor_critic.py)"""
+
+    def __init__(self, num_actor_obs: int, num_critic_obs: int, num_actions: int,
+                 actor_hidden_dims=(128, 64), critic_hidden_dims=(128, 64), init_noise_std: float = 1.0, min_std: float = 0.01):
+        super().__init__()
+        self.min_std = min_std
+        self.distribution = None
+        #>>! actor_obs_normalizer, critic_obs_normalizer, actor, critic, std 를 만들고 초기화한다
+        self.actor_obs_normalizer = RunningNormalization(num_actor_obs)
+        self.critic_obs_normalizer = RunningNormalization(num_critic_obs)
+        self.actor = create_mlp(num_actor_obs, actor_hidden_dims, num_actions)
+        self.critic = create_mlp(num_critic_obs, critic_hidden_dims, 1)
+        orthogonal_init(self.actor, last_layer_scale=0.01)
+        orthogonal_init(self.critic, last_layer_scale=1.0)
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        #<<
+
+    def update_distribution(self, actor_obs: torch.Tensor) -> None:
+        #>>
+        mean = self.actor(self.actor_obs_normalizer(actor_obs))
+        std = self.std.clamp(min=self.min_std).expand_as(mean)
+        self.distribution = torch.distributions.Normal(mean, std)
+        #<<
+
+    def act(self, actor_obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        #>>
+        self.update_distribution(actor_obs)
+        return self.distribution.mean if deterministic else self.distribution.sample()
+        #<<
+
+    def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        #>>
+        return self.distribution.log_prob(actions).sum(dim=-1)
+        #<<
+
+    def evaluate(self, critic_obs: torch.Tensor) -> torch.Tensor:
+        #>>
+        return self.critic(self.critic_obs_normalizer(critic_obs))
+        #<<
+
+    @property
+    def action_mean(self) -> torch.Tensor:
+        return self.distribution.mean
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        return self.distribution.stddev
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        #>>
+        return self.distribution.entropy().sum(dim=-1)
+        #<<
+
+#%% test
+torch.manual_seed(0)
+_ac = ActorCritic(9, 10, 2).to(DEVICE)
+_o, _co = torch.randn(4096, 9, device=DEVICE), torch.randn(4096, 10, device=DEVICE)
+_a = _ac.act(_o)
+check("액션 (N, 2), 가치 (N, 1)", _a.shape == (4096, 2) and _ac.evaluate(_co).shape == (4096, 1))
+check("처음에는 평균이 거의 0 (마지막 층 0.01 배)", _ac.action_mean.abs().max() < 0.1)
+check_close("처음에는 표본의 표준편차 ≈ init_noise_std", _a.std().item(), 1.0, atol=0.05)
+_lp = _ac.get_actions_log_prob(_a)
+_want = (-(_a - _ac.action_mean) ** 2 / (2 * _ac.action_std ** 2) - _ac.action_std.log() - 0.5 * math.log(2 * math.pi)).sum(-1)
+check_close("log_prob = 식 그대로, 차원에 대해 합", _lp, _want, atol=1e-4)
+check_close("엔트로피 = Σ (0.5 + 0.5 log 2π + log σ)", _ac.entropy, torch.full((4096,), 2 * (0.5 + 0.5 * math.log(2 * math.pi))), atol=1e-4)
+check_close("deterministic 이면 평균", _ac.act(_o, deterministic=True), _ac.action_mean, atol=0)
+check("std 는 학습 파라미터", any(p is _ac.std for p in _ac.parameters()))
+check("정규화기가 actor/critic 따로", _ac.actor_obs_normalizer.running_mean.shape == (9,) and _ac.critic_obs_normalizer.running_mean.shape == (10,))
+
+#%% md
+**실제 코드에서는**: Spider 의 네트워크는 은닉층 `(512, 256, 64)`, 활성화 tanh, 층마다 LayerNorm, 초기 std 3.0 입니다(`diden_rl/configs/`). std 를 다루는 방식도 고정 / 학습 / 스케줄 / 적응형 네 가지가 있습니다(`std_type`). 그리고 actor 입력에 **상태 추정기의 출력** 이 덧붙습니다. 추정기는 actor 관측에서 몸통 선속도·발 접촉·발 높이·자석 힘 상태를 맞히도록 지도학습되는 작은 네트워크입니다(`diden_rl/modules/state_estimator.py`, `algorithms/ppo_estimator.py`).

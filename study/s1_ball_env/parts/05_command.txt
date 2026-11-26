@@ -1,0 +1,180 @@
+#%% md
+## Part 5 — `CommandManager`: 목적지
+
+**명령(command)** 은 "정책에게 시키는 일" 입니다. Spider 보행에서는 원하는 속도 $(v_x, v_y, \omega_z)$ 이고, 여기서는 목적지의 위치 $(x, y)$ 입니다. 명령은 환경이 임의로 뽑고, 일정 시간이 지나면 다시 뽑습니다(resample). 한 에피소드 안에서 명령이 바뀌어야 정책이 "가는 법" 뿐 아니라 "방향을 바꾸는 법" 도 배웁니다.
+
+World 의 구조(`diden_env/managers/command_manager.py`)를 그대로 따릅니다.
+
+- `CommandTerm`: 명령 하나. 환경마다 남은 시간 `time_left` 를 들고 있다가 0 이하가 되면 그 환경만 다시 뽑습니다.
+- `CommandManager`: term 들을 이름으로 보관하고 `compute(dt)`, `reset(env_ids)`, `get_command(name)` 을 제공합니다.
+
+Spider 의 설정은 `resampling_time_range=(3, 6)` 초입니다. 우리는 `(4, 6)` 초, 에피소드 길이 8 초로 둡니다. 한 에피소드에 목적지가 한두 번 바뀝니다.
+
+### 문제 5-1. 균등분포에서 뽑기
+
+`(lo, hi)` 범위에서 `shape` 모양으로 뽑는 도우미입니다. `torch.rand` 는 [0, 1) 에서 뽑습니다.
+
+#%% ex
+def sample_uniform(lo: float, hi: float, shape, device=DEVICE) -> torch.Tensor:
+    #>> lo + (hi - lo) * rand
+    return lo + (hi - lo) * torch.rand(shape, device=device)
+    #<<
+
+#%% test
+torch.manual_seed(0)
+_s = sample_uniform(-3.0, 5.0, (100000, 2))
+check("모양과 범위", _s.shape == (100000, 2) and _s.min() >= -3.0 and _s.max() < 5.0)
+check_close("평균 ≈ 1, 표준편차 ≈ 8/√12", [_s.mean().item(), _s.std().item()], [1.0, 8 / math.sqrt(12)], atol=0.03)
+
+#%% md
+### 문제 5-2. `CommandTerm` 과 목적지 명령
+
+`CommandTerm` 의 두 메서드를 채웁니다.
+
+- `_resample(env_ids)`: 그 환경들의 `time_left` 를 `resampling_time_range` 에서 새로 뽑고, `_resample_command(env_ids)` 를 부른다.
+- `compute(dt)`: 모든 환경의 `time_left` 를 `dt` 만큼 줄이고, 0 이하가 된 환경만 `_resample` 한다.
+
+`UniformGoalCommand._resample_command(env_ids)` 는 그 환경들의 목적지 xy 를 범위 안에서 새로 뽑아 `self.goal_pos_w` 에 넣습니다.
+
+<details><summary>힌트</summary>
+
+조건을 만족하는 환경 번호는 `(self.time_left <= 0.0).nonzero(as_tuple=False).squeeze(-1)` 로 얻습니다. 하나도 없으면 길이 0 텐서가 나오므로 `if len(env_ids) > 0:` 으로 건너뜁니다.
+</details>
+
+#%% ex
+@configclass
+class CommandTermCfg:
+    class_type: type = None
+    resampling_time_range: tuple = (4.0, 6.0)
+
+
+class CommandTerm:
+    """명령 하나. (World: command_manager.py 의 CommandTerm)"""
+
+    def __init__(self, cfg: CommandTermCfg, env):
+        self.cfg, self._env = cfg, env
+        self.num_envs, self.device = env.num_envs, env.device
+        self.time_left = torch.zeros(self.num_envs, device=self.device)
+        self.command_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)   # 에피소드 안에서 몇 번째 명령인가
+
+    @property
+    def command(self) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        raise NotImplementedError
+
+    def _resample(self, env_ids: torch.Tensor) -> None:
+        #>> time_left 를 새로 뽑고 _resample_command, command_counter 증가
+        lo, hi = self.cfg.resampling_time_range
+        self.time_left[env_ids] = sample_uniform(lo, hi, (len(env_ids),), self.device)
+        self._resample_command(env_ids)
+        self.command_counter[env_ids] += 1
+        #<<
+
+    def compute(self, dt: float) -> None:
+        #>> 시간을 줄이고, 만료된 환경만 다시 뽑는다
+        self.time_left -= dt
+        env_ids = (self.time_left <= 0.0).nonzero(as_tuple=False).squeeze(-1)
+        if len(env_ids) > 0:
+            self._resample(env_ids)
+        #<<
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        self.command_counter[env_ids] = 0
+        self._resample(env_ids)
+
+
+class UniformGoalCommand(CommandTerm):
+    """세계 좌표계의 목적지 (x, y)."""
+
+    def __init__(self, cfg: "UniformGoalCommandCfg", env):
+        super().__init__(cfg, env)
+        self.goal_pos_w = torch.zeros(self.num_envs, 2, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self.goal_pos_w
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        #>> pos_x, pos_y 범위에서 뽑아 goal_pos_w[env_ids] 에 넣는다
+        n = len(env_ids)
+        self.goal_pos_w[env_ids, 0] = sample_uniform(*self.cfg.pos_x, (n,), self.device)
+        self.goal_pos_w[env_ids, 1] = sample_uniform(*self.cfg.pos_y, (n,), self.device)
+        #<<
+        # 그림용: 목적지 표시를 옮긴다 (World 에서는 debug_vis 가 하는 일)
+        marker = torch.zeros(self.num_envs, 3, device=self.device)
+        marker[:, :2] = self.goal_pos_w
+        self._env.sim_adapter.set_goal_marker(marker)
+
+
+@configclass
+class UniformGoalCommandCfg(CommandTermCfg):
+    class_type: type = UniformGoalCommand
+    pos_x: tuple = (-3.0, 3.0)
+    pos_y: tuple = (-3.0, 3.0)
+
+
+class CommandManager:
+    """(주어진 코드) 명령 term 들을 이름으로 보관한다."""
+
+    def __init__(self, cfg, env):
+        self._env = env
+        self._terms = {f.name: getattr(cfg, f.name).class_type(getattr(cfg, f.name), env)
+                       for f in fields(cfg) if getattr(cfg, f.name) is not None}
+
+    def get_command(self, name: str) -> torch.Tensor:
+        return self._terms[name].command
+
+    def get_term(self, name: str) -> CommandTerm:
+        return self._terms[name]
+
+    def compute(self, dt: float) -> None:
+        for term in self._terms.values():
+            term.compute(dt)
+
+    def reset(self, env_ids: torch.Tensor) -> dict:
+        for term in self._terms.values():
+            term.reset(env_ids)
+        return {}
+
+#%% test
+class _FakeEnv:
+    """매니저를 하나씩 따로 시험하기 위한 가짜 환경. 진짜 환경은 Part 11 에서 만든다."""
+
+    def __init__(self, num_envs=4096):
+        self.num_envs, self.device = num_envs, DEVICE
+        self.sim = BatchedSim(mjm, num_envs)
+        self.sim_adapter = SimAdapter(self.sim)
+        self.step_dt = 0.02
+        self.max_episode_length = 400
+        self.max_episode_length_s = 8.0
+        self.episode_length_buf = torch.zeros(num_envs, dtype=torch.long, device=DEVICE)
+
+@configclass
+class CommandsCfg:
+    goal = UniformGoalCommandCfg(resampling_time_range=(4.0, 6.0), pos_x=(-3.0, 3.0), pos_y=(-3.0, 3.0))
+
+torch.manual_seed(0)
+fake = _FakeEnv()
+fake.command_manager = CommandManager(CommandsCfg(), fake)
+_term = fake.command_manager.get_term("goal")
+_all = torch.arange(fake.num_envs, device=DEVICE)
+fake.command_manager.reset(_all)
+_g0 = fake.command_manager.get_command("goal").clone()
+check("명령 모양 (N, 2), 범위 ±3", _g0.shape == (4096, 2) and _g0.abs().max() <= 3.0)
+check("환경마다 다른 목적지", _g0.unique(dim=0).shape[0] > 4000)
+check("남은 시간이 4~6 초", _term.time_left.min() >= 4.0 and _term.time_left.max() < 6.0)
+for _ in range(199):                       # 3.98 초: 아직 아무도 만료되지 않는다
+    fake.command_manager.compute(0.02)
+check_close("만료 전에는 명령이 그대로", fake.command_manager.get_command("goal"), _g0, atol=0)
+for _ in range(60):                        # 5.18 초 시점
+    fake.command_manager.compute(0.02)
+_changed = (fake.command_manager.get_command("goal") != _g0).any(dim=1).float().mean().item()
+print(f"   5.18초 시점에 목적지가 바뀐 환경 비율: {_changed:.3f}  (기대값 (5.18−4)/2 = 0.59)")
+check("일부 환경만 다시 뽑힘 (0.5 ~ 0.7)", 0.5 < _changed < 0.7)
+check("다시 뽑힌 환경의 command_counter 는 2", (_term.command_counter == 2).float().mean().item() == _changed)
+check_close("목적지 표시(mocap)가 명령을 따라감", fake.sim.mocap_pos[:, 0, :2], fake.command_manager.get_command("goal"), atol=0)
+
+#%% md
+**실제 코드에서는**: Spider 의 명령 term 은 `UniformValidPosturalVelocityCommand` 입니다(`diden_env/mdp/commands/velocity_command.py`). 속도를 그냥 균등하게 뽑지 않고 55 % 는 직진만, 40 % 는 회전만 하도록 섞습니다. 명령 분포를 어떻게 잡는가가 정책이 무엇을 잘하게 되는가를 정합니다.

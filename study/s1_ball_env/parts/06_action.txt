@@ -1,0 +1,157 @@
+#%% md
+## Part 6 — `ActionManager`: 정책 출력에서 토크까지
+
+정책 네트워크가 내는 숫자는 단위가 없습니다. 대략 −1 ~ 1 근처의 값이고, 학습 초반에는 평균 0, 표준편차 1 쯤의 잡음입니다. 이것을 물리량으로 바꾸는 것이 action term 입니다.
+
+Spider 의 관절 액션(`diden_env/mdp/actions/joint_actions.py`)은
+
+$$q^{*} = \text{raw} \times \text{scale} + \text{offset}$$
+
+이고(`scale = 0.2 rad`, `offset = DEFAULT_JOINT_ANGLES_XML`), 이 $q^*$ 가 PD 제어기의 목표가 됩니다. 섹터 0 Part 6 에서 본 그 PD 입니다. Core 는 같은 식을 `action.cpp` 에서 `q = action_mean + joint_action_scale * raw` 로 다시 계산합니다. **scale 과 offset 이 두 레포에서 한 글자라도 다르면 sim-to-real 이 깨지므로**, World 는 이 값들을 ONNX 파일 안에 메타데이터로 같이 넣어 보냅니다(Part 17).
+
+공에는 관절이 없으니 우리 액션은 토크입니다. 정책 출력 2개 $(a_x, a_y)$ 를 "그 방향으로 굴러가게 하는 토크" 로 바꿉니다.
+
+$$\tau^{W} = s \cdot (\hat z \times \mathbf{a}) = s \cdot (-a_y,\; a_x,\; 0)$$
+
+$a = (1, 0)$ 이면 +y 축 토크가 걸려 공이 +x 로 굴러갑니다(섹터 0 문제 4-5).
+
+**scale 정하기.** Part 3 의 그래프에서, 헛돌지 않는 최대 토크는 마찰 0.3 일 때 0.82, 1.0 일 때 2.75 N·m 였습니다. `scale = 1.0 N·m`, `clip = 2.0` 으로 둡니다. 정책 출력 1 이 1 N·m (가속도 약 3.6 m/s²)이고, 최대 2 N·m 까지 낼 수 있습니다. 마찰이 낮은 환경에서는 최대 토크를 쓰면 헛돕니다.
+
+### 한 스텝 안의 두 박자
+
+`ActionManager` 에는 메서드가 두 개 있고 불리는 빈도가 다릅니다.
+
+- `process_action(action)`: 정책 스텝마다 **한 번**. raw 를 저장하고 clip·scale 을 계산해 둔다.
+- `apply_action()`: 물리 서브스텝마다 **매번** (`decimation` 번). 계산해 둔 값을 시뮬레이터에 써넣는다.
+
+Spider 에서는 정책이 100 Hz, 물리가 1000 Hz 로 돌아서 `decimation = 10` 입니다. 우리는 정책 50 Hz, 물리 200 Hz, `decimation = 4` 입니다.
+
+### 문제 6-1. `BallTorqueAction` 과 `ActionManager`
+
+`ActionManager` 는 `action`(이번 스텝의 raw)과 `prev_action`(직전 스텝의 raw)을 보관합니다. 둘 다 관측과 보상에서 씁니다. 리셋된 환경은 둘 다 0 으로 만듭니다.
+
+#%% ex
+@configclass
+class ActionTermCfg:
+    class_type: type = None
+    scale: float = 1.0
+    clip: float = None            # raw 액션을 ±clip 으로 자른다 (None 이면 자르지 않음)
+
+
+class ActionTerm:
+    action_dim: int = 0
+
+    def __init__(self, cfg: ActionTermCfg, env):
+        self.cfg, self._env = cfg, env
+        self.num_envs, self.device = env.num_envs, env.device
+        self.raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
+        self.processed_actions = torch.zeros_like(self.raw_actions)
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        raise NotImplementedError
+
+    def apply_actions(self) -> None:
+        raise NotImplementedError
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        self.raw_actions[env_ids] = 0.0
+        self.processed_actions[env_ids] = 0.0
+
+
+class BallTorqueAction(ActionTerm):
+    """정책 출력 (a_x, a_y) → 세계 좌표계 토크 s·(−a_y, a_x, 0)."""
+    action_dim = 2
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        #>> raw 저장 → clip → scale 을 processed_actions 에
+        self.raw_actions[:] = actions
+        a = actions if self.cfg.clip is None else actions.clamp(-self.cfg.clip, self.cfg.clip)
+        self.processed_actions[:] = a * self.cfg.scale
+        #<<
+
+    def apply_actions(self) -> None:
+        #>> processed_actions 로 (N, 3) 토크를 만들어 sim_adapter.set_external_torque_w
+        p = self.processed_actions
+        torque = torch.stack([-p[:, 1], p[:, 0], torch.zeros_like(p[:, 0])], dim=-1)
+        self._env.sim_adapter.set_external_torque_w(torque)
+        #<<
+
+
+@configclass
+class BallTorqueActionCfg(ActionTermCfg):
+    class_type: type = BallTorqueAction
+
+
+class ActionManager:
+    """(World: diden_env/managers/action_manager.py)"""
+
+    def __init__(self, cfg, env):
+        self._env = env
+        self._terms = {f.name: getattr(cfg, f.name).class_type(getattr(cfg, f.name), env)
+                       for f in fields(cfg) if getattr(cfg, f.name) is not None}
+        self.total_action_dim = sum(t.action_dim for t in self._terms.values())
+        self.action = torch.zeros(env.num_envs, self.total_action_dim, device=env.device)
+        self.prev_action = torch.zeros_like(self.action)
+
+    def process_action(self, action: torch.Tensor) -> None:
+        #>> prev_action ← action, action ← 새 값. 그리고 term 마다 자기 칸을 잘라 process_actions
+        self.prev_action[:] = self.action
+        self.action[:] = action
+        idx = 0
+        for term in self._terms.values():
+            term.process_actions(action[:, idx:idx + term.action_dim])
+            idx += term.action_dim
+        #<<
+
+    def apply_action(self) -> None:
+        for term in self._terms.values():
+            term.apply_actions()
+
+    def reset(self, env_ids: torch.Tensor) -> dict:
+        #>> 리셋된 환경의 action, prev_action 을 0 으로, term 도 reset
+        self.action[env_ids] = 0.0
+        self.prev_action[env_ids] = 0.0
+        for term in self._terms.values():
+            term.reset(env_ids)
+        #<<
+        return {}
+
+#%% test
+@configclass
+class ActionsCfg:
+    torque = BallTorqueActionCfg(scale=1.0, clip=2.0)
+
+fake = _FakeEnv(num_envs=8)
+fake.action_manager = ActionManager(ActionsCfg(), fake)
+check("액션 차원 2", fake.action_manager.total_action_dim == 2)
+_a = torch.zeros(8, 2, device=DEVICE)
+_a[:, 0] = torch.tensor([0.0, 0.5, 1.0, 2.0, 5.0, -1.0, 0.0, 0.0])
+_a[6, 1] = 1.0
+fake.action_manager.process_action(_a)
+_term = fake.action_manager._terms["torque"]
+check_close("raw 는 그대로 보관", _term.raw_actions, _a)
+check_close("processed 는 clip(±2) 후 scale", _term.processed_actions[:, 0], [0.0, 0.5, 1.0, 2.0, 2.0, -1.0, 0.0, 0.0])
+check("process 만으로는 시뮬레이터에 아무것도 쓰지 않음", fake.sim.xfrc_applied.abs().sum() == 0)
+fake.action_manager.apply_action()
+_bid = fake.sim_adapter.body_id
+check_close("a=(1,0) → +y 토크", fake.sim.xfrc_applied[2, _bid, 3:6], [0.0, 1.0, 0.0])
+check_close("a=(0,1) → −x 토크", fake.sim.xfrc_applied[6, _bid, 3:6], [-1.0, 0.0, 0.0])
+for _ in range(100):                                   # 0.5 초
+    fake.action_manager.apply_action()
+    fake.sim.step()
+_v = fake.sim_adapter.root_lin_vel_w
+check_close("a=(1,0): +x 로 가속, a = τ/(7/5·m·r)", _v[2, 0] / 0.5, 1.0 / (1.4 * BALL_MASS * BALL_RADIUS), rtol=0.02)
+check_close("a=(0,1): +y 로 가속", _v[6, 1] / 0.5, 1.0 / (1.4 * BALL_MASS * BALL_RADIUS), rtol=0.02)
+check("a=(−1,0): −x 로", _v[5, 0] < -1.0)
+fake.action_manager.process_action(torch.ones(8, 2, device=DEVICE))
+check_close("prev_action 은 직전 스텝의 raw", fake.action_manager.prev_action, _a)
+fake.action_manager.reset(torch.tensor([0, 1], device=DEVICE))
+check("리셋된 환경만 0", fake.action_manager.action[:2].abs().sum() == 0 and fake.action_manager.prev_action[:2].abs().sum() == 0
+      and fake.action_manager.action[2:].abs().sum() > 0)
+
+#%% md
+**실제 코드에서는**
+
+- **액션 지연.** 실제 로봇은 관측을 읽고 → 추론하고 → 명령이 모터에 도착하기까지 몇 ms 가 걸립니다. World 는 에피소드마다 3~5 ms, 스텝마다 ±2 ms 의 지연을 뽑아, `apply_action` 을 서브스텝 0 이 아니라 그만큼 뒤의 서브스텝에서 적용합니다(`diden_mjlab/env/mjwarp_env.py` 의 `perform_physics_step`, sim profile 의 action latency). 물리를 정책보다 잘게 쪼개 도는 이유 중 하나가 이 지연을 ms 단위로 흉내 내기 위해서입니다.
+- **clip 을 하지 않습니다.** Spider 의 정책은 `clip_actions=False` 입니다. 대신 보상에서 큰 액션과 급한 변화를 벌합니다.
+- **자석 액션.** Spider 에는 관절 12 개 외에 발 자석 4 개의 on/off 액션이 있고(`diden_domain/mdp/actions/magnet_actions.py`), `tanh` 를 거쳐 상태기계로 들어갑니다. `ActionManager` 가 액션 벡터를 term 별로 **잘라서** 나눠 주는 이유입니다(위의 `idx` 반복문).
